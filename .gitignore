@@ -1,0 +1,52 @@
+# macOS system files
+.DS_Store
+data
+.Rproj.user
+.positai
+old
+startup_benchmarks.csv
+startup_benchmarks.png
+
+
+# R session files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+Renviron
+.env
+.env.*
+.DS_Store
+
+
+# Secrets / local environment
+.Renviron
+.env
+.env.*
+*.key
+*.pem
+
+# macOS
+.DS_Store
+
+# RStudio
+*.Rproj.user
+
+# Temporary / cache
+tmp/
+temp/
+cache/
+*.log
+
+# Docker/local build clutter
+docker-compose.override.yml
+
+# Large local analysis outputs not needed by deployed app
+outputs/figures/
+outputs/tables/
+
+# Optional: raw or intermediate data not needed by Shiny
+data/raw/
+data/intermediate/
+
+

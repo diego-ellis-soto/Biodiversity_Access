@@ -1,0 +1,89 @@
+/* SF Biodiversity Access — pastel chrome (shinydashboard overrides) */
+
+.content-wrapper,
+.right-side {
+  background-color: #f3f8f5 !important;
+}
+
+.box {
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(61, 92, 74, 0.1);
+  box-shadow: 0 2px 14px rgba(45, 74, 58, 0.07);
+  margin-bottom: 20px;
+}
+
+.box .box-header {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.box.box-success > .box-header {
+  background: #c8e9d6 !important;
+  color: #1a4534 !important;
+  border-bottom: 1px solid rgba(26, 69, 52, 0.12);
+}
+
+.box.box-primary > .box-header {
+  background: #c9dcf5 !important;
+  color: #1f3d66 !important;
+  border-bottom: 1px solid rgba(31, 61, 102, 0.12);
+}
+
+.box.box-warning > .box-header {
+  background: #fce9c9 !important;
+  color: #5a4518 !important;
+  border-bottom: 1px solid rgba(90, 69, 24, 0.12);
+}
+
+.box.box-info > .box-header {
+  background: #c9ecf3 !important;
+  color: #1a4a55 !important;
+  border-bottom: 1px solid rgba(26, 74, 85, 0.12);
+}
+
+.box.box-danger > .box-header {
+  background: #f5d4d4 !important;
+  color: #5c2222 !important;
+  border-bottom: 1px solid rgba(92, 34, 34, 0.12);
+}
+
+.box-body {
+  background-color: #fcfdfc;
+}
+
+.well {
+  background-color: #f7faf8 !important;
+  border: 1px solid #e3ece6 !important;
+  border-radius: 10px !important;
+  box-shadow: none !important;
+}
+
+/* Main title bar: strong contrast; title uses Roboto (matches body), not Roboto Slab */
+.skin-green .main-header {
+  border-bottom: 2px solid rgba(25, 55, 42, 0.35);
+  box-shadow: 0 3px 14px rgba(25, 50, 38, 0.18);
+}
+
+.skin-green .main-header .logo {
+  background: linear-gradient(135deg, #5a8568 0%, #3d6b52 100%) !important;
+  color: #f7fffa !important;
+  border-right: 1px solid rgba(0, 0, 0, 0.12);
+  font-family: "Roboto", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+  font-weight: 700 !important;
+  font-size: 1.5rem !important;
+  letter-spacing: 0.02em !important;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+}
+
+.skin-green .main-header .navbar {
+  background: linear-gradient(135deg, #5a8568 0%, #3d6b52 100%) !important;
+}
+
+.skin-green .main-header .navbar .sidebar-toggle {
+  color: #f7fffa !important;
+}
+
+.skin-green .main-header .navbar .sidebar-toggle:hover {
+  background-color: rgba(255, 255, 255, 0.14) !important;
+}

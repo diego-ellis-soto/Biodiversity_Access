@@ -1,0 +1,13 @@
+name: SF_biodiv_access
+title: SF_biodiv_access
+username: diego-ellis-soto
+account: diego-ellis-soto
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 13693447
+bundleId: 9631093
+url: https://diego-ellis-soto.shinyapps.io/SF_biodiv_access/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: app_old.R

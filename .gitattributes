@@ -1,0 +1,6 @@
+outputs/results/isochrone_basi_100m.gpkg filter=lfs diff=lfs merge=lfs -text
+outputs/results/isochrone_basi_100m.rds filter=lfs diff=lfs merge=lfs -text
+www/Combined_logos.png filter=lfs diff=lfs merge=lfs -text
+www/Reimagining_San_Francisco.png filter=lfs diff=lfs merge=lfs -text
+outputs/results/gbif_cell_species_100m.rds filter=lfs diff=lfs merge=lfs -text
+outputs/results/grid_results_100m.gpkg filter=lfs diff=lfs merge=lfs -text

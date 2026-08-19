@@ -4,7 +4,8 @@ emoji: 📚
 colorFrom: blue
 colorTo: yellow
 sdk: docker
-license: bsd-2-clausepinned: false
+license: bsd-2-clause
+pinned: false
 ---
 
 # SF Biodiversity Access Decision Support Tool

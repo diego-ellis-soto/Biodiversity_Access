@@ -3410,6 +3410,159 @@ server <- function(input, output, session) {
     writeLines(html, con = file, useBytes = TRUE)
   }
   
+  # Store a lightweight static spatial map inside downloadable HTML report cards.
+  # The PNG is embedded as a base64 data URI, so the report remains self-contained.
+  report_card_map_uri <- function(writer) {
+    map_file <- tempfile(fileext = ".png")
+    on.exit(unlink(map_file), add = TRUE)
+    
+    map_ok <- tryCatch(writer(map_file), error = function(e) FALSE)
+    if (!isTRUE(map_ok) || !file.exists(map_file) ||
+        !is.finite(file.info(map_file)$size) || file.info(map_file)$size <= 0 ||
+        !requireNamespace("base64enc", quietly = TRUE)) {
+      return(NULL)
+    }
+    
+    paste0("data:image/png;base64,", base64enc::base64encode(map_file))
+  }
+  
+  report_card_map_section <- function(map_uri, alt = "Static spatial context map") {
+    map_html <- if (!is.null(map_uri)) {
+      paste0(
+        '<img src="', map_uri, '" alt="',
+        htmltools::htmlEscape(as.character(alt), attribute = TRUE),
+        '" style="display:block;width:100%;height:auto;max-height:620px;',
+        'object-fit:contain;border:1px solid #dbe8e1;border-radius:8px;background:white;">'
+      )
+    } else {
+      '<div style="min-height:220px;display:flex;align-items:center;justify-content:center;background:#f4f7f5;color:#66766e;border:1px solid #dbe8e1;border-radius:8px;">Static report map unavailable.</div>'
+    }
+    
+    paste0(
+      '<section class="section"><h2>Spatial context</h2>',
+      '<div class="note">Static map of the isochrone area(s) used for this report card. The map is embedded in this HTML file so the spatial context is retained with the report.</div>',
+      map_html,
+      '</section>'
+    )
+  }
+  
+  write_report_isochrone_map <- function(
+    file,
+    iso_list,
+    labels = NULL,
+    colors = NULL,
+    map_title = "Isochrone spatial context"
+  ) {
+    if (inherits(iso_list, "sf")) {
+      iso_list <- lapply(seq_len(nrow(iso_list)), function(i) iso_list[i, , drop = FALSE])
+    }
+    if (!is.list(iso_list)) iso_list <- list(iso_list)
+    
+    iso_list <- Filter(
+      function(x) !is.null(x) && inherits(x, "sf") && nrow(x) > 0,
+      iso_list
+    )
+    if (length(iso_list) == 0) return(FALSE)
+    
+    iso_list <- lapply(iso_list, function(x) {
+      suppressWarnings(sf::st_transform(sf::st_make_valid(x), 3857))
+    })
+    
+    n_iso <- length(iso_list)
+    if (is.null(labels) || length(labels) != n_iso) {
+      labels <- paste0("Isochrone ", seq_len(n_iso))
+    }
+    if (is.null(colors) || length(colors) != n_iso) {
+      colors <- rep("#2f6fb0", n_iso)
+    }
+    colors <- as.character(colors)
+    colors[is.na(colors) | !nzchar(colors)] <- "#2f6fb0"
+    
+    focus_geom <- do.call(c, lapply(iso_list, sf::st_geometry))
+    bb <- sf::st_bbox(focus_geom)
+    dx <- as.numeric(bb[["xmax"]] - bb[["xmin"]])
+    dy <- as.numeric(bb[["ymax"]] - bb[["ymin"]])
+    pad_x <- max(dx * 0.18, 400)
+    pad_y <- max(dy * 0.18, 400)
+    map_bb <- sf::st_bbox(c(
+      xmin = bb[["xmin"]] - pad_x,
+      ymin = bb[["ymin"]] - pad_y,
+      xmax = bb[["xmax"]] + pad_x,
+      ymax = bb[["ymax"]] + pad_y
+    ), crs = sf::st_crs(3857))
+    
+    local_cbg <- NULL
+    if (exists("cbg_vect_sf", inherits = TRUE)) {
+      local_cbg <- tryCatch({
+        cbg <- get("cbg_vect_sf", inherits = TRUE)
+        suppressWarnings(sf::st_crop(sf::st_transform(cbg, 3857), map_bb))
+      }, error = function(e) NULL)
+    }
+    
+    grDevices::png(file, width = 1500, height = 920, res = 170, bg = "white")
+    on.exit(grDevices::dev.off(), add = TRUE)
+    graphics::par(mar = c(0.4, 0.4, 1.4, 0.4), xaxs = "i", yaxs = "i")
+    
+    graphics::plot(
+      sf::st_geometry(iso_list[[1]]),
+      col = NA,
+      border = NA,
+      xlim = c(map_bb[["xmin"]], map_bb[["xmax"]]),
+      ylim = c(map_bb[["ymin"]], map_bb[["ymax"]]),
+      axes = FALSE,
+      asp = 1
+    )
+    
+    if (!is.null(local_cbg) && nrow(local_cbg) > 0) {
+      graphics::plot(
+        sf::st_geometry(local_cbg),
+        add = TRUE,
+        col = "#f6f7f6",
+        border = "#d8ddda",
+        lwd = 0.5
+      )
+    }
+    
+    for (i in seq_len(n_iso)) {
+      graphics::plot(
+        sf::st_geometry(iso_list[[i]]),
+        add = TRUE,
+        col = grDevices::adjustcolor(colors[[i]], alpha.f = 0.20),
+        border = colors[[i]],
+        lwd = 2.2
+      )
+    }
+    
+    label_points <- lapply(iso_list, function(x) {
+      suppressWarnings(sf::st_point_on_surface(sf::st_union(sf::st_geometry(x))))
+    })
+    label_xy <- do.call(rbind, lapply(label_points, sf::st_coordinates))
+    if (!is.null(label_xy) && nrow(label_xy) == n_iso) {
+      graphics::points(
+        label_xy[, 1], label_xy[, 2],
+        pch = 21, bg = "white", col = colors,
+        cex = 1.3, lwd = 1.8
+      )
+      graphics::text(
+        label_xy[, 1], label_xy[, 2],
+        labels = seq_len(n_iso),
+        cex = 0.72, font = 2, col = colors
+      )
+    }
+    
+    graphics::legend(
+      "bottomleft",
+      legend = paste0(seq_len(n_iso), ". ", labels),
+      fill = grDevices::adjustcolor(colors, alpha.f = 0.20),
+      border = colors,
+      bg = grDevices::adjustcolor("white", alpha.f = 0.92),
+      cex = 0.72,
+      bty = "o"
+    )
+    graphics::mtext(map_title, side = 3, line = 0.2, cex = 0.82, font = 2, col = "#294337")
+    TRUE
+  }
+  
   # ---------------------------------------------------------------------------
   # DuckDB connection
   # ---------------------------------------------------------------------------
@@ -5847,11 +6000,36 @@ server <- function(input, output, session) {
         check.names = FALSE
       )
       
+      map_iso <- isochrones_data()
+      map_labels <- if (!is.null(map_iso) && nrow(map_iso) > 0) {
+        vapply(seq_len(nrow(map_iso)), function(i) {
+          paste0(pretty_mode(as.character(map_iso$mode[[i]])), " ", as.numeric(map_iso$time[[i]]), " min")
+        }, character(1))
+      } else character(0)
+      map_colors <- if (!is.null(map_iso) && nrow(map_iso) > 0) {
+        vapply(seq_len(nrow(map_iso)), function(i) {
+          clr <- unname(mode_palette[pretty_mode(as.character(map_iso$mode[[i]]))])
+          if (length(clr) == 0 || is.na(clr) || !nzchar(clr)) "#666666" else clr
+        }, character(1))
+      } else character(0)
+      map_uri <- if (!is.null(map_iso) && nrow(map_iso) > 0) {
+        report_card_map_uri(function(path) {
+          write_report_isochrone_map(
+            path,
+            map_iso,
+            labels = map_labels,
+            colors = map_colors,
+            map_title = "Isochrone Explorer — spatial context"
+          )
+        })
+      } else NULL
+      
       write_report_card(
         file,
         "Isochrone Explorer — Biodiversity Access Report Card",
         "Citywide same-mode × same-time benchmarking",
         sections = paste0(
+          report_card_map_section(map_uri, "Map of Isochrone Explorer analysis areas"),
           '<section class="section"><h2>Results</h2>',
           '<div class="note">Every BAI dimension is shown as a raw value paired with its citywide percentile. BAI score /100 is the seven-axis mean; BAI citywide percentile is a separate rank of that composite score against complete same-mode × same-time reference BAIs.</div>',
           report_card_table(report_df),
@@ -5903,11 +6081,37 @@ server <- function(input, output, session) {
       
       report_df <- dplyr::bind_rows(side_row(res$a, "Point A"), side_row(res$b, "Point B"))
       
+      map_iso <- list()
+      map_labels <- character()
+      map_colors <- character()
+      if (!is.null(res$a) && !is.null(res$a$iso) && nrow(res$a$iso) > 0) {
+        map_iso[[length(map_iso) + 1L]] <- res$a$iso
+        map_labels <- c(map_labels, paste0("Point A — ", res$a$label))
+        map_colors <- c(map_colors, cmp_color_a)
+      }
+      if (!is.null(res$b) && !is.null(res$b$iso) && nrow(res$b$iso) > 0) {
+        map_iso[[length(map_iso) + 1L]] <- res$b$iso
+        map_labels <- c(map_labels, paste0("Point B — ", res$b$label))
+        map_colors <- c(map_colors, cmp_color_b)
+      }
+      map_uri <- if (length(map_iso) > 0) {
+        report_card_map_uri(function(path) {
+          write_report_isochrone_map(
+            path,
+            map_iso,
+            labels = map_labels,
+            colors = map_colors,
+            map_title = "Isochrone Comparer — spatial context"
+          )
+        })
+      } else NULL
+      
       write_report_card(
         file,
         "Isochrone Comparer — Report Card",
         "Point A and Point B are benchmarked independently",
         sections = paste0(
+          report_card_map_section(map_uri, "Map of Point A and Point B isochrone analysis areas"),
           '<section class="section"><h2>Comparison</h2>',
           '<div class="note">Each point uses its own matching SF transportation-mode × travel-time reference. Raw values and percentiles remain paired, and the two BAI quantities are reported separately.</div>',
           report_card_table(report_df),
@@ -5945,11 +6149,36 @@ server <- function(input, output, session) {
         check.names = FALSE
       )
       
+      map_iso <- isochrones_data()
+      map_labels <- if (!is.null(map_iso) && nrow(map_iso) > 0) {
+        vapply(seq_len(nrow(map_iso)), function(i) {
+          paste0(pretty_mode(as.character(map_iso$mode[[i]])), " ", as.numeric(map_iso$time[[i]]), " min")
+        }, character(1))
+      } else character(0)
+      map_colors <- if (!is.null(map_iso) && nrow(map_iso) > 0) {
+        vapply(seq_len(nrow(map_iso)), function(i) {
+          clr <- unname(mode_palette[pretty_mode(as.character(map_iso$mode[[i]]))])
+          if (length(clr) == 0 || is.na(clr) || !nzchar(clr)) "#666666" else clr
+        }, character(1))
+      } else character(0)
+      map_uri <- if (!is.null(map_iso) && nrow(map_iso) > 0) {
+        report_card_map_uri(function(path) {
+          write_report_isochrone_map(
+            path,
+            map_iso,
+            labels = map_labels,
+            colors = map_colors,
+            map_title = "Green Investment & Displacement Context — spatial context"
+          )
+        })
+      } else NULL
+      
       write_report_card(
         file,
         "Green Investment & Displacement Context — Report Card",
         "Equity-sensitive greening context; not a displacement-risk score",
         sections = paste0(
+          report_card_map_section(map_uri, "Map of isochrone areas used for the green investment and displacement context report"),
           '<section class="section"><h2>Context</h2>',
           report_card_table(report_df),
           '</section>',

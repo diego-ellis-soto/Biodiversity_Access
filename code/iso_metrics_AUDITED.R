@@ -10,7 +10,7 @@
 #   compute_iso_metrics() isochrone sf + point     -> per-isochrone metric data.frame
 #   draw_radar()          BAI df                   -> spider/radar plot (base graphics)
 #
-# These functions read the *static* objects loaded by Rscripts/setup_unified.R
+# These functions read the *static* objects loaded by code/setup_unified.R
 # directly as globals (cbg_vect_sf, osm_greenspace, the distance/NDVI rasters,
 # rsf_projects, cbg_greenspace_coverage, gtfs_stops_sf, gtfs_routes_sf,
 # gtfs_router, transit_iso_cache, cenv_sf, sf_ej_sf) plus the helpers/config
@@ -28,7 +28,7 @@
 
 # Shared scientific definition used by both interactive and Step-5 calculations.
 if (!exists("ISO_METRIC_DEFINITION_VERSION", inherits = TRUE)) {
-  source("Rscripts/iso_metric_definitions.R", local = TRUE)
+  source("code/iso_metric_definitions.R", local = TRUE)
 }
 
 # ----------------------------------------------------------------------------

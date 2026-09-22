@@ -1,7 +1,7 @@
 # ============================================================================
 # Prep: Per-CBG greenspace coverage -> data/output
 # ============================================================================
-# Inputs:  cbg_vect_sf + osm_greenspace (loaded via Rscripts/setup_unified.R,
+# Inputs:  cbg_vect_sf + osm_greenspace (loaded via code/setup_unified.R,
 #          which pulls them from data/cached/ or HuggingFace)
 # Output:  data/output/cbg_greenspace_coverage.csv  (GEOID, greenspace_m2, cbg_area_m2)
 #
@@ -16,7 +16,7 @@
 
 # Reuse the app's canonical loader so coverage is computed from the exact same
 # cbg_vect_sf + osm_greenspace the app uses (also gives us sf/dplyr, etc.).
-source("Rscripts/setup_unified.R")
+source("code/setup_unified.R")
 
 out_dir <- "data/output"
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)

@@ -148,6 +148,10 @@ source("code/setup_unified.R")
 # =============================================================================
 # GLOBAL CONFIG
 # =============================================================================
+# Local dev only: .env is git-ignored and holds MAPBOX_TOKEN. Deployed
+# environments (rsconnect/Docker) set the env var directly, so this is a no-op there.
+if (file.exists(".env")) readRenviron(".env")
+
 mapbox_token <- Sys.getenv("MAPBOX_TOKEN")
 
 if (!nzchar(mapbox_token)) {
@@ -1370,6 +1374,26 @@ iso_metric_row_label <- function(df, i) {
   if (is.finite(time_i)) paste0(mode_i, " — ", time_i, " min") else mode_i
 }
 
+# ggplot2's coord_polar() treats the transform as non-linear, so it "munches"
+# straight Cartesian segments (geom_polygon/geom_line edges) into curved arcs
+# once projected onto the circle — that's what produces the spiral look on a
+# radar chart. Overriding is_linear = TRUE tells the polar grid to keep edges
+# as straight chords between vertices instead of arcing them.
+coord_radar <- function(theta = "x", start = 0, direction = 1, clip = "off") {
+  theta <- match.arg(theta, c("x", "y"))
+  r <- if (theta == "x") "y" else "x"
+  ggplot2::ggproto(
+    "CoordRadar",
+    ggplot2::CoordPolar,
+    theta = theta,
+    r = r,
+    start = start,
+    direction = sign(direction),
+    clip = clip,
+    is_linear = function(coord) TRUE
+  )
+}
+
 # Radar plot for independently scored isochrones. Each polygon/line is one
 # isochrone row; there is no averaging or pooling across mode/time combinations.
 #
@@ -1637,7 +1661,7 @@ draw_reference_radar <- function(
   print(
     base_plot +
       axis_label_layers +
-      ggplot2::coord_polar(clip = "off") +
+      coord_radar(clip = "off") +
       ggplot2::scale_y_continuous(
         limits = c(0, 112),
         breaks = c(0, 25, 50, 75, 100),

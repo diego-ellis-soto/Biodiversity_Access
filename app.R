@@ -6556,6 +6556,11 @@ server <- function(input, output, session) {
       bird_pct <- if ("pctile_Bird_Species" %in% names(df)) df$pctile_Bird_Species[[i]] else NA_real_
       mammal_pct <- if ("pctile_Mammal_Species" %in% names(df)) df$pctile_Mammal_Species[[i]] else NA_real_
       plant_pct <- if ("pctile_Plant_Species" %in% names(df)) df$pctile_Plant_Species[[i]] else NA_real_
+      # % native among plant species with an iNaturalist establishment status
+      # (native/endemic vs introduced); status-unknown species are excluded.
+      plant_native <- if ("Plant_Native_Species" %in% names(df)) df$Plant_Native_Species[[i]] else NA_real_
+      plant_intro <- if ("Plant_Introduced_Species" %in% names(df)) df$Plant_Introduced_Species[[i]] else NA_real_
+      plant_known <- plant_native + plant_intro
       n_ref <- if ("nref_GBIF_Species" %in% names(df)) df$nref_GBIF_Species[[i]] else NA_integer_
       
       tags$div(
@@ -6594,7 +6599,18 @@ server <- function(input, output, session) {
           tags$div(
             style = "background:#f6faf7; border:1px solid #e0ebe4; border-radius:6px; padding:6px 8px;",
             tags$b("Plants"), tags$br(),
-            tags$small(paste0(fmt_count(plant_raw), " species · ", format_pct(plant_pct)))
+            tags$small(paste0(fmt_count(plant_raw), " species · ", format_pct(plant_pct))),
+            if (is.finite(plant_known) && plant_known > 0) {
+              tags$small(
+                style = "display:block;",
+                title = paste0(
+                  "Of ", fmt_count(plant_known), " plant species with an iNaturalist establishment status, ",
+                  fmt_count(plant_native), " are native or endemic. ",
+                  fmt_count(plant_raw - plant_known), " species without a status are excluded."
+                ),
+                paste0(round(100 * plant_native / plant_known), "% native")
+              )
+            }
           )
         ),
         if (is.finite(total_pct)) {

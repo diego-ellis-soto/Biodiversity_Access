@@ -104,6 +104,21 @@ biodiv_coldspots <- st_read(coldspots_shp, quiet = TRUE) |> st_transform(4326)
 gbif_parquet <- hf_or_local("gbif_census_ndvi_anno.parquet")
 
 # ----------------------------------------------------------------------------
+# Plant provenance (iNaturalist establishment means per GBIF plant species) --
+# "% native" in the biodiversity score box. Named vector: species -> "native" /
+# "endemic" / "introduced" / NA (no iNat status). NULL if the file is missing.
+# ----------------------------------------------------------------------------
+prov_path <- hf_or_local("plant_provenance.csv")
+plant_establishment <- if (file.exists(prov_path) && file.size(prov_path) > 0) {
+  prov <- readr::read_csv(prov_path, col_types = readr::cols(.default = readr::col_character()),
+                          show_col_types = FALSE)
+  setNames(prov$establishment_means, prov$species)
+} else {
+  message("[setup] plant_provenance.csv not found; % native will be unavailable.")
+  NULL
+}
+
+# ----------------------------------------------------------------------------
 # Census block groups (CBG) -- Income / Richness / Data map layers
 # ----------------------------------------------------------------------------
 load(hf_or_local("cbg_vect_sf.Rdata"))

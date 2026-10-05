@@ -10,7 +10,7 @@
 #   compute_iso_metrics() isochrone sf + point     -> per-isochrone metric data.frame
 #   draw_radar()          BAI df                   -> spider/radar plot (base graphics)
 #
-# These functions read the *static* objects loaded by Rscripts/setup_unified.R
+# These functions read the *static* objects loaded by code/setup_unified.R
 # directly as globals (cbg_vect_sf, osm_greenspace, the distance/NDVI rasters,
 # rsf_projects, cbg_greenspace_coverage, gtfs_stops_sf, gtfs_routes_sf,
 # gtfs_router, transit_iso_cache, cenv_sf, sf_ej_sf) plus the helpers/config
@@ -28,7 +28,7 @@
 
 # Shared scientific definition used by both interactive and Step-5 calculations.
 if (!exists("ISO_METRIC_DEFINITION_VERSION", inherits = TRUE)) {
-  source("Rscripts/iso_metric_definitions.R", local = TRUE)
+  source("code/iso_metric_definitions.R", local = TRUE)
 }
 
 # ----------------------------------------------------------------------------
@@ -156,7 +156,8 @@ summarise_iso_metric_support <- function(poly_i) {
     return(list(
       cell_ids = integer(0), n_cells = 0L, area_m2 = NA_real_, area_km2 = NA_real_,
       n_records = NA_real_, n_species = NA_real_, n_birds = NA_real_,
-      n_mammals = NA_real_, n_plants = NA_real_, sampling_density = NA_real_,
+      n_mammals = NA_real_, n_plants = NA_real_, n_plants_native = NA_real_,
+      n_plants_introduced = NA_real_, sampling_density = NA_real_,
       mean_ndvi = NA_real_, greenspace_pct = NA_real_, n_stops = NA_real_,
       transit_access = NA_real_, unique_routes = NA_real_, nearest_stop_m = NA_real_,
       calenviro_ci = NA_real_, traffic_pct = NA_real_, sf_ej = NA_real_
@@ -170,6 +171,7 @@ summarise_iso_metric_support <- function(poly_i) {
   n_stops <- sum(tidyr::replace_na(support$n_stops, 0), na.rm = TRUE)
   
   spp <- load_iso_species_cell_lookup()
+  n_plants_native <- n_plants_introduced <- NA_real_
   if (is.null(spp)) {
     n_species <- n_birds <- n_mammals <- n_plants <- NA_real_
   } else {
@@ -178,6 +180,13 @@ summarise_iso_metric_support <- function(poly_i) {
     n_birds <- dplyr::n_distinct(s$species[s$class == "Aves"], na.rm = TRUE)
     n_mammals <- dplyr::n_distinct(s$species[s$class == "Mammalia"], na.rm = TRUE)
     n_plants <- dplyr::n_distinct(s$species[s$class %in% ISO_PLANT_CLASSES], na.rm = TRUE)
+    # Endemic counts as native; species without an iNat status stay NA and are
+    # excluded from both counts (and so from the % native denominator).
+    if (!is.null(plant_establishment)) {
+      plant_status <- plant_establishment[unique(s$species[s$class %in% ISO_PLANT_CLASSES])]
+      n_plants_native <- sum(plant_status %in% c("native", "endemic"))
+      n_plants_introduced <- sum(plant_status %in% "introduced")
+    }
   }
   
   route_lookup <- load_iso_route_cell_lookup()
@@ -197,6 +206,8 @@ summarise_iso_metric_support <- function(poly_i) {
     n_birds = n_birds,
     n_mammals = n_mammals,
     n_plants = n_plants,
+    n_plants_native = n_plants_native,
+    n_plants_introduced = n_plants_introduced,
     sampling_density = if (is.finite(area_km2) && area_km2 > 0) n_records / area_km2 else NA_real_,
     mean_ndvi = iso_weighted_mean(support$mean_ndvi, support$cell_area_m2),
     greenspace_pct = if (is.finite(area_m2) && area_m2 > 0) {
@@ -490,6 +501,8 @@ compute_iso_metrics <- function(iso_data, point, gbif_tab) {
         Bird_Species = as.numeric(support$n_birds),
         Mammal_Species = as.numeric(support$n_mammals),
         Plant_Species = as.numeric(support$n_plants),
+        Plant_Native_Species = as.numeric(support$n_plants_native),
+        Plant_Introduced_Species = as.numeric(support$n_plants_introduced),
         SamplingDensity_km2 = as.numeric(support$sampling_density),
         Greenspace_percent = as.numeric(support$greenspace_pct),
         Transit_Stops = as.numeric(support$n_stops),

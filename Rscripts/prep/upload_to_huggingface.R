@@ -10,7 +10,8 @@
 # Or upload files from data/output/ directly via the web UI.
 #
 # Already on HuggingFace (not staged from data/output): greenspaces_osm_nad83.{shp,...}
-# Other manual assets: SF_EastBay_NDVI_Sentinel_10.tif, cbg_vect_sf.Rdata, hotspots/coldspots
+# Other manual assets: SF_EastBay_NDVI_Sentinel_10.tif, cbg_vect_sf.Rdata, hotspots/coldspots,
+# plant_provenance.csv (iNaturalist establishment means per GBIF plant species)
 #
 # GTFS: sf_muni_gtfs.zip contains the feed; timetable .rds + headways .csv are
 # precomputed (~20–30 s) so the app does not rebuild them every session.

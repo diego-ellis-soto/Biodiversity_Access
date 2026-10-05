@@ -148,6 +148,10 @@ source("code/setup_unified.R")
 # =============================================================================
 # GLOBAL CONFIG
 # =============================================================================
+# Local dev only: .env is git-ignored and holds MAPBOX_TOKEN. Deployed
+# environments (rsconnect/Docker) set the env var directly, so this is a no-op there.
+if (file.exists(".env")) readRenviron(".env")
+
 mapbox_token <- Sys.getenv("MAPBOX_TOKEN")
 
 if (!nzchar(mapbox_token)) {
@@ -1370,6 +1374,26 @@ iso_metric_row_label <- function(df, i) {
   if (is.finite(time_i)) paste0(mode_i, " — ", time_i, " min") else mode_i
 }
 
+# ggplot2's coord_polar() treats the transform as non-linear, so it "munches"
+# straight Cartesian segments (geom_polygon/geom_line edges) into curved arcs
+# once projected onto the circle — that's what produces the spiral look on a
+# radar chart. Overriding is_linear = TRUE tells the polar grid to keep edges
+# as straight chords between vertices instead of arcing them.
+coord_radar <- function(theta = "x", start = 0, direction = 1, clip = "off") {
+  theta <- match.arg(theta, c("x", "y"))
+  r <- if (theta == "x") "y" else "x"
+  ggplot2::ggproto(
+    "CoordRadar",
+    ggplot2::CoordPolar,
+    theta = theta,
+    r = r,
+    start = start,
+    direction = sign(direction),
+    clip = clip,
+    is_linear = function(coord) TRUE
+  )
+}
+
 # Radar plot for independently scored isochrones. Each polygon/line is one
 # isochrone row; there is no averaging or pooling across mode/time combinations.
 #
@@ -1637,7 +1661,7 @@ draw_reference_radar <- function(
   print(
     base_plot +
       axis_label_layers +
-      ggplot2::coord_polar(clip = "off") +
+      coord_radar(clip = "off") +
       ggplot2::scale_y_continuous(
         limits = c(0, 112),
         breaks = c(0, 25, 50, 75, 100),
@@ -6532,6 +6556,11 @@ server <- function(input, output, session) {
       bird_pct <- if ("pctile_Bird_Species" %in% names(df)) df$pctile_Bird_Species[[i]] else NA_real_
       mammal_pct <- if ("pctile_Mammal_Species" %in% names(df)) df$pctile_Mammal_Species[[i]] else NA_real_
       plant_pct <- if ("pctile_Plant_Species" %in% names(df)) df$pctile_Plant_Species[[i]] else NA_real_
+      # % native among plant species with an iNaturalist establishment status
+      # (native/endemic vs introduced); status-unknown species are excluded.
+      plant_native <- if ("Plant_Native_Species" %in% names(df)) df$Plant_Native_Species[[i]] else NA_real_
+      plant_intro <- if ("Plant_Introduced_Species" %in% names(df)) df$Plant_Introduced_Species[[i]] else NA_real_
+      plant_known <- plant_native + plant_intro
       n_ref <- if ("nref_GBIF_Species" %in% names(df)) df$nref_GBIF_Species[[i]] else NA_integer_
       
       tags$div(
@@ -6570,7 +6599,18 @@ server <- function(input, output, session) {
           tags$div(
             style = "background:#f6faf7; border:1px solid #e0ebe4; border-radius:6px; padding:6px 8px;",
             tags$b("Plants"), tags$br(),
-            tags$small(paste0(fmt_count(plant_raw), " species · ", format_pct(plant_pct)))
+            tags$small(paste0(fmt_count(plant_raw), " species · ", format_pct(plant_pct))),
+            if (is.finite(plant_known) && plant_known > 0) {
+              tags$small(
+                style = "display:block;",
+                title = paste0(
+                  "Of ", fmt_count(plant_known), " plant species with an iNaturalist establishment status, ",
+                  fmt_count(plant_native), " are native or endemic. ",
+                  fmt_count(plant_raw - plant_known), " species without a status are excluded."
+                ),
+                paste0(round(100 * plant_native / plant_known), "% native")
+              )
+            }
           )
         ),
         if (is.finite(total_pct)) {

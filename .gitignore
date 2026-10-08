@@ -50,3 +50,15 @@ data/raw/
 data/intermediate/
 
 
+
+# Paper figures/tables: analysis outputs, not app assets. Keeping them out also
+# avoids Hugging Face's binary-file rejection, which has no LFS rule for *.png
+# (only the two www/ logos are tracked by exact path).
+outputs/paper_BAS_vs_IBBAI/
+outputs/city_briefing/
+outputs/results/connectivity/
+outputs/results/transit/
+
+# Editor/working backups - never deploy these
+*.bak
+*.bak[0-9]

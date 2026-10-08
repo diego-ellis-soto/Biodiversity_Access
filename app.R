@@ -231,8 +231,8 @@ pretty_mode <- function(x) {
     x == "walking"         ~ "Walking",
     x == "cycling"         ~ "Cycling",
     x == "driving-traffic" ~ "Driving-Traffic",
-    x == "transit"         ~ "Transit",
-    x == "walk_transit"    ~ "Walk-Transit",
+    x == "transit"         ~ "Transit (optimistic)",
+    x == "walk_transit"    ~ "Walk + Transit (conservative)",
     TRUE                   ~ tools::toTitleCase(x)
   )
 }
@@ -677,6 +677,101 @@ gtfs_isochrone_compat <- function(gtfs, from, start_time, end_time,
   out[!duplicated(out$stop_id), , drop = FALSE]
 }
 
+# ---------------------------------------------------------------------------
+# REALISTIC TRANSIT ISOCHRONE
+# ---------------------------------------------------------------------------
+# The original Transit mode drew the CONVEX HULL of the stops reachable from the
+# single nearest stop. A hull measures how far apart the outermost stops are,
+# not what you can reach: a few far-flung stops on fast radial corridors fill in
+# a huge triangle of land no route serves, while dense inner-city service with
+# fifty nearby stops draws a small one. Measured from two origins at 15 min,
+# Telegraph Hill reached MORE of the network (52 stops vs 43) yet got a hull less
+# than half the size (1.41 vs 3.03 km2).
+#
+# This is the standard construction instead - walk to nearby stops, ride, then
+# walk out from each destination stop with whatever time remains, and union the
+# pieces, giving the characteristic "beads along corridors" shape:
+#
+#   reachable = walkshed(origin, T)
+#               U { walkshed(stop s, T - access(s0) - ride(s0 -> s)) }
+#
+# Walking speed is 60 m/min, calibrated rather than assumed: the median Mapbox
+# walking-network isochrone at 5/10/15 min has an equal-area radius implying
+# 62.3 / 60.1 / 59.4 m/min, so a straight-line 80 m/min would overstate the
+# reachable area by about (80/60)^2 = 1.8x. Buffers are computed in UTM
+# (ISO_METRIC_CRS), not Web Mercator, which at this latitude would inflate every
+# distance by roughly 1/cos(37.8) = 1.27x.
+build_transit_isochrone_union <- function(
+    location_sf, total_time_min, dep_secs, gtfs_stops_sf, gtfs_router,
+    walk_m_per_min = 60, max_access_min = 10, max_board_stops = 8,
+    charge_wait = FALSE
+) {
+  if (is.null(gtfs_router) || is.null(gtfs_stops_sf)) return(NULL)
+  if (!is.finite(total_time_min) || total_time_min <= 0) return(NULL)
+  
+  loc_m   <- st_transform(location_sf, ISO_METRIC_CRS)
+  stops_m <- st_transform(gtfs_stops_sf, ISO_METRIC_CRS)
+  
+  # you can always just walk, so the origin's own walkshed is always included
+  parts <- list(st_geometry(st_buffer(loc_m, total_time_min * walk_m_per_min)))
+  
+  access_min <- as.numeric(st_distance(loc_m, stops_m)) / walk_m_per_min
+  
+  # Expected wait for the first vehicle. A rider who turns up without consulting
+  # a timetable waits, on average, half the headway. The median Muni headway is
+  # 15 min, so this charges about 7.5 min of a 15 min budget - which is why the
+  # paper reports it as a separate variant rather than folding it in silently.
+  # Waiting at any TRANSFER is already inside gtfs_traveltimes()'s duration, so
+  # only the boarding wait is added here.
+  wait_min <- rep(0, nrow(stops_m))
+  if (isTRUE(charge_wait)) {
+    hw <- suppressWarnings(as.numeric(gtfs_stops_sf$mean_headway_min))
+    if (all(is.na(hw))) {
+      warning("no headway data on gtfs_stops_sf; expected wait not charged")
+    } else {
+      hw[is.na(hw)] <- stats::median(hw, na.rm = TRUE)   # stops with no data
+      wait_min <- hw / 2
+    }
+  }
+  
+  board <- which(access_min + wait_min <= total_time_min &
+                   access_min <= min(max_access_min, total_time_min))
+  
+  if (length(board) > 0) {
+    # nearest few boarding stops only: routing every stop within walking range
+    # would make one map click take tens of seconds and barely move the shape.
+    board <- board[order(access_min[board])][seq_len(min(length(board), max_board_stops))]
+    
+    sid_all <- as.character(gtfs_stops_sf$stop_id)
+    best <- rep(Inf, length(sid_all))      # best total time to reach each stop
+    for (bi in board) {
+      remaining <- total_time_min - access_min[bi] - wait_min[bi]
+      if (remaining <= 0) next
+      rr <- gtfs_isochrone_compat(
+        gtfs = gtfs_router, from = sid_all[bi], start_time = dep_secs,
+        end_time = dep_secs + remaining * 60, from_is_id = TRUE
+      )
+      if (is.null(rr) || !nrow(rr)) next
+      idx <- match(as.character(rr$stop_id), sid_all)
+      ok  <- !is.na(idx)
+      if (!any(ok)) next
+      cost <- access_min[bi] + wait_min[bi] + rr$duration[ok] / 60
+      best[idx[ok]] <- pmin(best[idx[ok]], cost)
+    }
+    
+    egress_min <- total_time_min - best
+    keep <- which(is.finite(egress_min) & egress_min > 0)
+    if (length(keep) > 0) {
+      parts <- append(parts, list(st_geometry(
+        st_buffer(stops_m[keep, ], egress_min[keep] * walk_m_per_min))))
+    }
+  }
+  
+  out <- st_union(do.call(c, parts))
+  if (length(out) == 0) return(NULL)
+  st_transform(out, 4326)
+}
+
 build_walk_transit_isochrone <- function(
     location_sf, total_time_min, dep_secs,
     walk_to_stop_min, walk_from_stop_min,
@@ -834,37 +929,45 @@ build_walk_transit_isochrone <- function(
 # call for the pure Transit mode. It is loaded here with that one call rewritten
 # to the shim above, so this file stays the only thing that changes on disk.
 # Equivalent to source("code/iso_metrics_AUDITED.R", local = TRUE) otherwise.
-.iso_audited_src <- paste(readLines("code/iso_metrics_AUDITED.R", warn = FALSE), collapse = "\n")
+.iso_lines <- readLines("code/iso_metrics_AUDITED.R", warn = FALSE)
 
-# (a) the missing routing function, as above.
-if (!grepl("gtfsrouter::gtfs_isochrone(", .iso_audited_src, fixed = TRUE))
-  message("[app] no gtfs_isochrone call found in code/iso_metrics_AUDITED.R - loading it unchanged.")
-.iso_audited_src <- gsub("gtfsrouter::gtfs_isochrone(", "gtfs_isochrone_compat(",
-                         .iso_audited_src, fixed = TRUE)
+# (a) Replace the whole Transit block with a call to the realistic builder
+# above. Line-based splice rather than a text substitution, because the block
+# spans nested braces that no single regex matches safely.
+.b0 <- grep("^    stop_dists  <- st_distance\\(location_sf, gtfs_stops_sf\\)$", .iso_lines)
+.b1 <- grep("^      if \\(!is.null\\(iso_poly\\)\\) \\{$", .iso_lines)
+if (length(.b0) == 1 && length(.b1) >= 1 && any(.b1 > .b0)) {
+  .b1 <- .b1[.b1 > .b0][1]
+  .iso_lines <- c(
+    .iso_lines[seq_len(.b0 - 1L)],
+    "    dep_secs <- as.numeric(transit_hour) * 3600",
+    "",
+    "    for (t in times) {",
+    "      # transit_iso_cache is bypassed on purpose: it stores the old convex",
+    "      # hulls keyed on the nearest stop, which are the wrong geometry.",
+    "      iso_poly <- tryCatch(",
+    "        build_transit_isochrone_union(",
+    "          location_sf = location_sf, total_time_min = t, dep_secs = dep_secs,",
+    "          gtfs_stops_sf = gtfs_stops_sf, gtfs_router = gtfs_router,",
+    "          charge_wait = isTRUE(getOption(\"bas.transit_charge_wait\", FALSE))),",
+    "        error = function(e) {",
+    "          warning(\"transit isochrone failed: \", conditionMessage(e)); NULL })",
+    "",
+    .iso_lines[seq(.b1, length(.iso_lines))]
+  )
+} else {
+  message("[app] could not locate the Transit block in code/iso_metrics_AUDITED.R - left unchanged.")
+}
 
-# (b) the Transit polygon is the convex hull of the REACHABLE STOPS only, which
-# does not contain the origin. Whenever the lines serving the nearest stop run
-# off in one direction, the hull sits to one side and the start point falls
-# outside its own isochrone. Adding the origin to the point set fixes that: a
-# convex hull of a set containing the origin always contains the origin.
-# The origin is added as a small DISC, not a bare point: added as a point it
-# becomes a vertex of the convex hull, so it lands exactly on the boundary and
-# still reads as "outside" to the user and to st_within(). 100 m matches the
-# buffer this file already uses for the few-stops fallback below.
-.iso_audited_src <- sub(
-  "st_convex_hull(st_union(reachable_sf))",
-  paste0("st_convex_hull(st_combine(c(st_geometry(reachable_sf), ",
-         "st_geometry(st_transform(st_buffer(st_transform(location_sf, 3857), 100), 4326)))))"),
-  .iso_audited_src, fixed = TRUE)
-.iso_audited_src <- sub(
-  "st_union(st_buffer(st_transform(reachable_sf, 3857), 100))",
-  "st_union(st_buffer(st_transform(st_combine(c(st_geometry(reachable_sf), st_geometry(location_sf))), 3857), 100))",
-  .iso_audited_src, fixed = TRUE)
+# (b) safety net: any remaining call to the function that does not exist in
+# gtfsrouter 0.1.4 still routes through the shim.
+.iso_lines <- gsub("gtfsrouter::gtfs_isochrone(", "gtfs_isochrone_compat(",
+                   .iso_lines, fixed = TRUE)
 
 # Evaluated at top level, so the definitions land in this app environment -
 # exactly where source(..., local = TRUE) would have put them.
-eval(parse(text = .iso_audited_src))
-rm(.iso_audited_src)
+eval(parse(text = paste(.iso_lines, collapse = "\n")))
+rm(.iso_lines, .b0, .b1)
 
 # The audited helper is sourced into this app environment. Replace only its two
 # lazy lookup loaders so they keep using the absolute project-root paths above
@@ -1882,8 +1985,8 @@ transport_mode_choices <- list(
   "Walking"               = "walking",
   "Cycling"               = "cycling",
   "Driving with Traffic"  = "driving-traffic",
-  "Transit (GTFS)"        = "transit",
-  "Walk + Transit (Muni)" = "walk_transit"
+  "Transit - optimistic (no wait)" = "transit",
+  "Walk + Transit - conservative" = "walk_transit"
 )
 
 # =============================================================================
@@ -2297,8 +2400,8 @@ ui <- dashboardPage(
                 "Walking"               = "walking",
                 "Cycling"               = "cycling",
                 "Driving with Traffic"  = "driving-traffic",
-                "Transit (GTFS)"        = "transit",
-                "Walk + Transit (Muni)" = "walk_transit"
+                "Transit - optimistic (no wait)" = "transit",
+                "Walk + Transit - conservative" = "walk_transit"
               ),
               selected = c("driving", "walking")
             ),
@@ -2315,7 +2418,36 @@ ui <- dashboardPage(
                 "Transit departure flexibility window (minutes):",
                 min = 0, max = 20, value = 10, step = 5
               ),
-              helpText("Several departures after the selected time can be evaluated for walk + transit.")
+              helpText("Several departures after the selected time can be evaluated for walk + transit."),
+              checkboxInput(
+                "transit_charge_wait",
+                "Charge the expected wait (half the headway at the boarding stop)",
+                value = FALSE
+              ),
+              helpText(
+                "Off by default, matching the paper's turn-up-and-go upper bound. Switching it on ",
+                "reproduces the paper's scheduled variant: the median Muni headway is 15 minutes, so ",
+                "this costs about 7.5 minutes of a 15-minute budget."
+              ),
+              tags$div(
+                style = paste("background:#eef4fb; border-left:4px solid #2166ac;",
+                              "padding:9px 11px; margin-top:9px; font-size:12px; line-height:1.5;"),
+                tags$b("The two transit modes bracket the answer - they are not duplicates."),
+                tags$ul(
+                  style = "margin:6px 0 0 0; padding-left:18px;",
+                  tags$li(tags$b("Transit - optimistic. "),
+                          "Walk up to 10 min to a stop, ride, then walk out with ALL remaining time. ",
+                          "No waiting is charged. Straight-line walking at a calibrated 60 m/min. ",
+                          "Fast, no API cost. ", tags$i("This is the method used in the paper.")),
+                  tags$li(tags$b("Walk + Transit - conservative. "),
+                          "First and last mile each capped by your sliders above (default 5 min), ",
+                          "only the 12 best last-mile stops, best departure searched across the window, ",
+                          "and real street-network walksheds from Mapbox. Slower and uses API calls.")
+                ),
+                tags$div(style = "margin-top:6px; color:#44515c;",
+                         "Measured at 15 min, the optimistic mode returns roughly 2-4x the area. ",
+                         "The truth sits between them: treat them as an upper and a lower bound.")
+              )
             ),
             
             conditionalPanel(
@@ -3229,9 +3361,37 @@ ui <- dashboardPage(
             status = "primary", solidHeader = TRUE, width = 12,
             p(
               style = "font-size: 13px; color: #555;",
-              "Six modes are supported across two routing engines. Walk + Transit is an approximation ",
-              "combining a Mapbox first-mile walk, GTFS stop-to-stop reachability (SF Muni), and a last-mile ",
-              "walk buffer — not a full door-to-door multimodal isochrone."
+              "Six modes are supported across two routing engines. Both transit modes now walk at BOTH ends ",
+              "— you cannot reach nature by riding past it, only by getting off and walking — so they differ ",
+              "in how generous they are, not in whether walking is included."
+            ),
+            tags$div(
+              style = paste("background:#eef4fb; border-left:4px solid #2166ac; padding:11px 13px;",
+                            "margin:4px 0 12px 0; font-size:13px; line-height:1.55;"),
+              tags$b("Why there are two transit modes"),
+              tags$p(style = "margin:6px 0 0 0;",
+                     "They bracket the answer rather than duplicating it. Measured at a 15-minute budget the ",
+                     "optimistic mode returns roughly two to four times the area of the conservative one; the ",
+                     "honest reading is that reality sits between them."),
+              tags$ul(
+                style = "margin:8px 0 0 0; padding-left:18px;",
+                tags$li(tags$b("Transit — optimistic (no wait). "),
+                        "Access walk capped at 10 minutes, then all remaining time is given to the walk out ",
+                        "from each reachable stop. No waiting for the vehicle is charged. Walking is a ",
+                        "straight-line buffer at 60 m/min — calibrated, not assumed: the median Mapbox ",
+                        "walking-network isochrone at 5/10/15 minutes implies 62.3 / 60.1 / 59.4 m/min, so a ",
+                        "nominal 80 m/min would overstate reachable area by about 1.8x. No API calls, under ",
+                        "a second per query. ", tags$b("This is the construction used in the manuscript.")),
+                tags$li(tags$b("Walk + Transit — conservative. "),
+                        "First and last mile each capped by the sliders (5 minutes by default), only the 12 ",
+                        "best last-mile stops are buffered, the best departure within the flexibility window ",
+                        "is searched, and the walksheds are real Mapbox street-network isochrones rather than ",
+                        "circles. Slower, and it consumes Mapbox API calls.")
+              ),
+              tags$p(style = "margin:8px 0 0 0; color:#44515c;",
+                     "Neither charges a half-headway wait. Since the median Muni headway is 15 minutes, an ",
+                     "expected 7.5-minute wait would consume half of a 15-minute budget, so both modes remain ",
+                     "optimistic about waiting even though they differ in how far they let you walk.")
             ),
             tags$table(
               class = "table table-hover table-sm",
@@ -4125,7 +4285,7 @@ server <- function(input, output, session) {
           "Species Richness", "Data Availability",
           "CalEnviroScreen (CI Score)", "SF EJ Communities",
           "Transit Routes", "Transit Stops",
-          "Isochrones", "Transit Isochrones", "NDVI Raster"
+          "Isochrones", "Transit Isochrones", "Muni Stops Reached", "NDVI Raster"
         ),
         options = layersControlOptions(collapsed = TRUE)
       ) |>
@@ -5487,6 +5647,7 @@ server <- function(input, output, session) {
       clearGroup("selected_point") |>
       clearGroup("Isochrones") |>
       clearGroup("Transit Isochrones") |>
+      clearGroup("Muni Stops Reached") |>
       clearGroup("NDVI Raster")
   })
   
@@ -5514,7 +5675,15 @@ server <- function(input, output, session) {
   })
   outputOptions(output, "proposal_ready", suspendWhenHidden = FALSE)
   
+  # build_isochrones() lives in the sourced helper and its signature is shared
+  # with the comparer tab, so the wait toggle is passed as an option rather than
+  # threaded through as another argument.
+  observeEvent(input$transit_charge_wait, {
+    options(bas.transit_charge_wait = isTRUE(input$transit_charge_wait))
+  }, ignoreNULL = FALSE)
+  
   observeEvent(input$generate_iso, {
+    options(bas.transit_charge_wait = isTRUE(input$transit_charge_wait))
     pt <- chosen_point()
     if (is.null(pt)) return()
     if (length(input$transport_modes) == 0) return()
@@ -5524,6 +5693,7 @@ server <- function(input, output, session) {
       removeControl("ndvi_legend") |>
       clearGroup("Isochrones") |>
       clearGroup("Transit Isochrones") |>
+      clearGroup("Muni Stops Reached") |>
       clearGroup("NDVI Raster")
     
     # All isochrone construction lives in build_isochrones() (code/iso_metrics_AUDITED.R)
@@ -5550,6 +5720,7 @@ server <- function(input, output, session) {
       removeControl("ndvi_legend") |>
       clearGroup("Isochrones") |>
       clearGroup("Transit Isochrones") |>
+      clearGroup("Muni Stops Reached") |>
       clearGroup("NDVI Raster")
     
     standard_like_modes <- c("driving", "walking", "cycling", "driving-traffic", "walk_transit")
@@ -5603,7 +5774,11 @@ server <- function(input, output, session) {
         poly_i <- transit_iso[i, ]
         time_i <- as.numeric(poly_i$time[[1]])
         
-        n_stops_in <- tryCatch(nrow(st_intersection(gtfs_stops_sf, poly_i)), error = function(e) 0)
+        # keep the stops themselves, not just the count: they are drawn below so
+        # the user can see WHERE the isochrone lets them get off and walk out.
+        stops_in <- tryCatch(suppressWarnings(st_intersection(gtfs_stops_sf, poly_i)),
+                             error = function(e) NULL)
+        n_stops_in <- if (is.null(stops_in)) 0 else nrow(stops_in)
         area_km2   <- round(as.numeric(st_area(st_transform(poly_i, 3857))) / 1e6, 2)
         t_score    <- if (area_km2 > 0) round(n_stops_in / area_km2, 2) else NA_real_
         
@@ -5637,6 +5812,24 @@ server <- function(input, output, session) {
             label = paste0("Transit ", time_i, " min"),
             popup = popup_html
           )
+        
+        # Draw the reachable stops only for the LARGEST budget, which is a
+        # superset of the smaller ones - drawing them per budget would stack
+        # several markers on the same stop.
+        if (!is.null(stops_in) && nrow(stops_in) > 0 &&
+            isTRUE(time_i == max(as.numeric(transit_iso$time), na.rm = TRUE))) {
+          leafletProxy("isoMap") |>
+            addCircleMarkers(
+              data = stops_in,
+              group = "Muni Stops Reached",
+              radius = 3.5, weight = 1,
+              color = "#20456e", fillColor = "#4a90d9", fillOpacity = 0.9,
+              label = ~paste0(stop_name, " (", stop_id, ")"),
+              popup = ~paste0("<strong>", stop_name, "</strong><br>Stop ID: ", stop_id,
+                              "<br><small>Reachable within ", time_i,
+                              " min, including the walk at each end.</small>")
+            )
+        }
       }
     }
     

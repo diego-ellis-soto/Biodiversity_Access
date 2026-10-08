@@ -208,3 +208,10 @@ This tool is a **decision-support prototype** co-developed with the RSF Data Wor
 ---
 
 <img src="www/hexbin_RSF_logo.png" width="80">
+
+# Adding to huggingface
+git add .
+git commit -m "Update app"
+git push origin main
+git lfs push --all hf
+git push --force hf main:main

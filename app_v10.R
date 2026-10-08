@@ -701,6 +701,69 @@ gtfs_isochrone_compat <- function(gtfs, from, start_time, end_time,
 # reachable area by about (80/60)^2 = 1.8x. Buffers are computed in UTM
 # (ISO_METRIC_CRS), not Web Mercator, which at this latitude would inflate every
 # distance by roughly 1/cos(37.8) = 1.27x.
+# ---------------------------------------------------------------------------
+# SURVEY GAPS (simple)
+# ---------------------------------------------------------------------------
+# One question: where has nobody looked, in places that look like habitat?
+# Units are 1 km (10 x 10 native cells) because that is the coarsest sensible
+# survey block and it keeps the map readable.
+#
+# "Frontier" = below-median recording effort AND above-median greenness. The
+# habitat axis is NDVI, deliberately NOT a fitted richness model: our own
+# spatial cross-validation shows a habitat model trained where inventories are
+# deep does not transfer to the survey gaps (rho = 0.109), so projecting one
+# here would dress a guess up as a prediction. NDVI is a transparent proxy and
+# the user can see exactly what it is.
+.survey_gap_cache <- new.env(parent = emptyenv())
+
+load_survey_gaps <- function() {
+  if (exists("g", envir = .survey_gap_cache, inherits = FALSE))
+    return(get("g", envir = .survey_gap_cache, inherits = FALSE))
+
+  grid <- sf::st_read(project_path("outputs", "results", "grid_results_100m.gpkg"),
+                      quiet = TRUE) |>
+    sf::st_drop_geometry()
+  spp <- tryCatch(readRDS(project_path("outputs", "results", "gbif_cell_species_100m.rds")),
+                  error = function(e) NULL)
+
+  # 1 km blocks from the lon/lat lattice
+  dx <- stats::median(diff(sort(unique(round(grid$lon, 6)))), na.rm = TRUE)
+  dy <- stats::median(diff(sort(unique(round(grid$lat, 6)))), na.rm = TRUE)
+  grid$blk <- paste0(floor((grid$lon - min(grid$lon, na.rm = TRUE)) / (dx * 10)), "_",
+                     floor((grid$lat - min(grid$lat, na.rm = TRUE)) / (dy * 10)))
+
+  agg <- stats::aggregate(
+    cbind(n_records, est_population, mean_ndvi, greenspace_pct, sf_ej_score, lon, lat) ~ blk,
+    data = grid, FUN = function(x) mean(x, na.rm = TRUE), na.action = stats::na.pass)
+  sums <- stats::aggregate(cbind(n_records, est_population) ~ blk, data = grid,
+                           FUN = function(x) sum(x, na.rm = TRUE), na.action = stats::na.pass)
+  agg$n_records <- sums$n_records[match(agg$blk, sums$blk)]
+  agg$est_population <- sums$est_population[match(agg$blk, sums$blk)]
+  agg$n_cells <- as.integer(table(grid$blk)[agg$blk])
+
+  # distinct species per block (a union, not a sum - richness is not additive)
+  if (!is.null(spp)) {
+    key <- grid$blk[match(spp$cell_id, grid$cell_id)]
+    ok  <- !is.na(key) & !is.na(spp$species)
+    nsp <- tapply(spp$species[ok], key[ok], function(z) length(unique(z)))
+    agg$n_species <- as.integer(nsp[agg$blk]); agg$n_species[is.na(agg$n_species)] <- 0L
+  } else agg$n_species <- NA_integer_
+
+  # Drop edge slivers. A "1 km block" holding one or two 100 m cells is a ragged
+  # offcut at the city boundary, and "zero records in two cells" is trivially
+  # true - without this the top of the list is all slivers, some of them outside
+  # San Francisco proper.
+  agg <- agg[is.finite(agg$lon) & is.finite(agg$lat) & agg$n_cells >= 50, , drop = FALSE]
+  eff_cut  <- stats::median(agg$n_records, na.rm = TRUE)
+  ndvi_cut <- stats::median(agg$mean_ndvi, na.rm = TRUE)
+  agg$frontier <- agg$n_records <= eff_cut & agg$mean_ndvi > ndvi_cut
+  agg$eff_cut <- eff_cut; agg$ndvi_cut <- ndvi_cut
+  agg <- agg[order(-agg$frontier, agg$n_records, -agg$mean_ndvi), , drop = FALSE]
+
+  assign("g", agg, envir = .survey_gap_cache)
+  agg
+}
+
 build_transit_isochrone_union <- function(
     location_sf, total_time_min, dep_secs, gtfs_stops_sf, gtfs_router,
     walk_m_per_min = 60, max_access_min = 10, max_board_stops = 8,
@@ -2000,6 +2063,7 @@ ui <- dashboardPage(
     sidebarMenu(id = "tabs",
                 menuItem("Isochrone Explorer", tabName = "isochrone", icon = icon("map-marker-alt")),
                 menuItem("Isochrone Comparer", tabName = "comparer", icon = icon("balance-scale")),
+                menuItem("Survey Gaps", tabName = "gaps", icon = icon("binoculars")),
                 menuItem("Green Corridor Planner", tabName = "corridor", icon = icon("project-diagram")),
                 menuItem("Green Investment & Displacement Context", tabName = "displacement", icon = icon("home")),
                 menuItem("About", tabName = "about", icon = icon("info-circle"))
@@ -2728,6 +2792,39 @@ ui <- dashboardPage(
       # =====================================================================
       # Green Corridor Planner tab
       # =====================================================================
+      tabItem(
+        tabName = "gaps",
+        fluidRow(
+          box(
+            width = 12, status = "warning", solidHeader = TRUE,
+            title = tagList(icon("binoculars"), " Where has nobody looked?"),
+            p(style = "margin-bottom:6px;",
+              "Every other tab scores what has ", tags$i("already been recorded"), ". This one does the ",
+              "opposite: it shows 1 km blocks with ", tags$b("below-median recording effort"),
+              " but ", tags$b("above-median greenness"), " - places that look like habitat and that ",
+              "nobody has surveyed. Click a block for its numbers."),
+            tags$div(
+              style = paste("background:#fff4e5; border-left:4px solid #d94801; padding:8px 11px;",
+                            "font-size:12px; line-height:1.5;"),
+              tags$b("Greenness, not a richness model. "),
+              "The habitat axis is NDVI rather than a fitted richness surface, on purpose: a habitat model ",
+              "trained where inventories are deep does not transfer to the survey gaps (spatial ",
+              "cross-validated rho = 0.109). These are the best available bets at neighbourhood scale, ",
+              "not predictions about any single block."
+            )
+          )
+        ),
+        fluidRow(
+          box(width = 8, status = "warning", solidHeader = TRUE, title = "Survey gap map",
+              leafletOutput("gapMap", height = 560) %>% withSpinner(type = 8, color = "#f0ad4e")),
+          box(width = 4, status = "warning", solidHeader = TRUE, title = "Selected block",
+              uiOutput("gapReadout"))
+        ),
+        fluidRow(
+          box(width = 12, status = "warning", solidHeader = TRUE, collapsible = TRUE,
+              title = "Top 10 survey gaps", DTOutput("gapTable"))
+        )
+      ),
       tabItem(
         tabName = "corridor",
         fluidRow(
@@ -5678,6 +5775,87 @@ server <- function(input, output, session) {
   # build_isochrones() lives in the sourced helper and its signature is shared
   # with the comparer tab, so the wait toggle is passed as an option rather than
   # threaded through as another argument.
+  # --- Survey Gaps -----------------------------------------------------------
+  gap_data <- reactive({
+    tryCatch(load_survey_gaps(), error = function(e) {
+      message("[app] survey gaps failed: ", conditionMessage(e)); NULL })
+  })
+  gap_click <- reactiveVal(NULL)
+
+  output$gapMap <- renderLeaflet({
+    g <- gap_data(); req(g)
+    pal <- c("TRUE" = "#d94801", "FALSE" = "#c8cdd2")
+    leaflet() |>
+      addTiles() |>
+      setView(lng = -122.4394, lat = 37.7566, zoom = 12) |>
+      addCircleMarkers(
+        lng = g$lon, lat = g$lat, layerId = g$blk,
+        radius = 8, stroke = TRUE, weight = 1, color = "#5a6b62",
+        fillColor = unname(pal[as.character(g$frontier)]), fillOpacity = 0.82,
+        label = ifelse(g$frontier, "Survey gap - click for detail", "Already surveyed or not green")
+      ) |>
+      addLegend("bottomright", colors = unname(pal), opacity = 0.85,
+                labels = c("Survey gap", "Other"), title = "1 km block")
+  })
+
+  observeEvent(input$gapMap_marker_click, { gap_click(input$gapMap_marker_click$id) })
+
+  output$gapReadout <- renderUI({
+    g <- gap_data(); req(g)
+    id <- gap_click()
+    if (is.null(id)) return(helpText("Click an orange block on the map."))
+    r <- g[g$blk == id, , drop = FALSE]
+    if (!nrow(r)) return(helpText("No data for that block."))
+    # scales::comma() prints zero decimal places, so NDVI (0.143) came out as "0".
+    # Counts keep the thousands separator; decimals keep their digits.
+    fm <- function(x, d = 0) {
+      if (!is.finite(x)) return("n/a")
+      if (d == 0) scales::comma(round(x)) else formatC(x, format = "f", digits = d)
+    }
+    tagList(
+      tags$div(
+        style = paste0("background:", if (isTRUE(r$frontier)) "#fff4e5" else "#eef1f3",
+                       "; border-left:5px solid ",
+                       if (isTRUE(r$frontier)) "#d94801" else "#8c969d",
+                       "; padding:10px 12px; margin-bottom:10px;"),
+        tags$h4(style = "margin:0;", if (isTRUE(r$frontier)) "Survey gap" else "Not a priority"),
+        tags$p(style = "margin:3px 0 0 0;",
+               if (isTRUE(r$frontier))
+                 "Below-median effort and above-median greenness. Worth a visit."
+               else
+                 "Either already reasonably surveyed, or not green enough to expect much.")
+      ),
+      tags$ul(
+        tags$li(tags$b("Records so far: "), fm(r$n_records),
+                " (citywide median ", fm(r$eff_cut), ")"),
+        tags$li(tags$b("Species recorded: "), fm(r$n_species)),
+        tags$li(tags$b("Greenness (NDVI): "), fm(r$mean_ndvi, 3),
+                " (median ", fm(r$ndvi_cut, 3), ")"),
+        tags$li(tags$b("Green space: "), fm(r$greenspace_pct, 1), "%"),
+        tags$li(tags$b("Residents nearby: "), fm(r$est_population)),
+        tags$li(tags$b("EJ burden score: "), fm(r$sf_ej_score, 1))
+      ),
+      helpText("Residents and EJ burden are shown so a survey can be chosen for who it reaches, ",
+               "not only for how many species it might add.")
+    )
+  })
+
+  output$gapTable <- renderDT({
+    g <- gap_data(); req(g)
+    d <- head(g[g$frontier, , drop = FALSE], 10)
+    if (!nrow(d)) return(datatable(data.frame(Message = "No blocks meet the criteria.")))
+    out <- data.frame(
+      Block = d$blk,
+      Records = round(d$n_records),
+      Species = d$n_species,
+      NDVI = round(d$mean_ndvi, 3),
+      `Green %` = round(d$greenspace_pct, 1),
+      Residents = round(d$est_population),
+      check.names = FALSE
+    )
+    datatable(out, rownames = FALSE, options = list(dom = "t", pageLength = 10))
+  })
+
   observeEvent(input$transit_charge_wait, {
     options(bas.transit_charge_wait = isTRUE(input$transit_charge_wait))
   }, ignoreNULL = FALSE)

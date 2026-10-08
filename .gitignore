@@ -62,3 +62,7 @@ outputs/results/transit/
 # Editor/working backups - never deploy these
 *.bak
 *.bak[0-9]
+
+# Local rollback copies of large reference files - regenerable, never commit
+outputs/results/*_pre_transit.rds
+outputs/results/*_backup.rds

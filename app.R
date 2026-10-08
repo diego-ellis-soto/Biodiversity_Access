@@ -145,6 +145,33 @@ if (length(.missing_harmonized_files) > 0) {
 source("code/iso_metric_definitions.R")
 source("code/setup_unified.R")
 
+# --- transit fix: the timetable must carry a transfers table ----------------
+# gtfs_traveltimes() refuses to run without one, and gtfs_transfer_table() has
+# to be applied to the RAW feed BEFORE gtfs_timetable(). setup_unified.R caches
+# a timetable built without transfers, which is the second reason transit
+# returns nothing. Prefer a transfers-enriched cache and build it once if absent.
+if (!is.null(gtfs_router) && is.null(gtfs_router$transfers)) {
+  gtfs_router <- tryCatch({
+    enriched <- file.path(cache_dir, "gtfs_timetable_monday_transfers.rds")
+    if (file.exists(enriched)) {
+      readRDS(enriched)
+    } else {
+      raw <- gtfsrouter::extract_gtfs(gtfs_zip_path, quiet = TRUE)
+      raw <- gtfsrouter::gtfs_transfer_table(raw, d_limit = 200, min_transfer_time = 120)
+      tt  <- gtfsrouter::gtfs_timetable(raw, day = "Monday", quiet = TRUE)
+      tryCatch(saveRDS(tt, enriched), error = function(e) NULL)
+      tt
+    }
+  }, error = function(e) {
+    warning("could not add a GTFS transfers table; transit will be unavailable: ",
+            conditionMessage(e))
+    gtfs_router
+  })
+}
+if (!is.null(gtfs_router) && is.null(gtfs_router$transfers)) {
+  message("[app] GTFS timetable has no transfers table - transit modes will return nothing.")
+}
+
 # =============================================================================
 # GLOBAL CONFIG
 # =============================================================================
@@ -583,6 +610,73 @@ build_last_mile_walkshed <- function(
   st_sf(geometry = walk_geom, crs = 4326)
 }
 
+# ---------------------------------------------------------------------------
+# TRANSIT COMPATIBILITY SHIM
+# ---------------------------------------------------------------------------
+# gtfsrouter::gtfs_isochrone() does NOT exist in gtfsrouter 0.1.4 -- the package
+# exports gtfs_traveltimes() and nothing else for routing. Every call to it
+# therefore throws, and because each call site wraps the call in
+# tryCatch(error = function(e) NULL) the failure is swallowed: Transit and
+# Walk + Transit silently return no isochrone instead of reporting an error.
+# The namespace is locked, so the missing function cannot be injected into
+# gtfsrouter; the call sites have to be routed through this shim instead.
+#
+# The shim keeps the gtfs_isochrone() argument names and returns `duration` as
+# NUMERIC SECONDS, which is what the existing extract_transit_minutes() already
+# expects (it divides by 60). gtfs_traveltimes() itself returns duration as an
+# "HH:MM:SS" STRING, where as.numeric() yields NA -- converting it here is what
+# keeps the downstream code working unchanged.
+.hms_to_seconds <- function(x) {
+  if (is.numeric(x)) return(as.numeric(x))
+  if (inherits(x, "difftime")) return(as.numeric(x, units = "secs"))
+  x <- as.character(x)
+  out <- rep(NA_real_, length(x))
+  ok <- !is.na(x) & grepl("^[0-9]+:[0-9]{2}:[0-9]{2}$", x)
+  if (any(ok)) {
+    p <- do.call(rbind, strsplit(x[ok], ":", fixed = TRUE))
+    out[ok] <- as.numeric(p[, 1]) * 3600 + as.numeric(p[, 2]) * 60 + as.numeric(p[, 3])
+  }
+  out
+}
+
+gtfs_isochrone_compat <- function(gtfs, from, start_time, end_time,
+                                  from_is_id = TRUE,
+                                  departure_window_secs = 1800) {
+  if (is.null(gtfs)) return(NULL)
+  start_time <- as.numeric(start_time)
+  end_time   <- as.numeric(end_time)
+  max_tt_secs <- end_time - start_time
+  if (!is.finite(max_tt_secs) || max_tt_secs <= 0) return(NULL)
+  
+  tt <- tryCatch(
+    gtfsrouter::gtfs_traveltimes(
+      gtfs,
+      from              = as.character(from),
+      from_is_id        = isTRUE(from_is_id),
+      start_time_limits = c(start_time, start_time + departure_window_secs),
+      max_traveltime    = ceiling(max_tt_secs)
+    ),
+    error = function(e) {
+      warning("gtfs_traveltimes failed from stop ", from, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+  if (is.null(tt) || !nrow(tt) || !("stop_id" %in% names(tt))) return(NULL)
+  
+  dur_secs <- .hms_to_seconds(tt$duration)
+  keep <- is.finite(dur_secs) & dur_secs <= max_tt_secs
+  if (!any(keep)) return(NULL)
+  
+  out <- data.frame(
+    stop_id  = as.character(tt$stop_id)[keep],
+    duration = dur_secs[keep],          # numeric seconds, as the callers expect
+    stringsAsFactors = FALSE
+  )
+  if ("stop_lon" %in% names(tt)) out$stop_lon <- tt$stop_lon[keep]
+  if ("stop_lat" %in% names(tt)) out$stop_lat <- tt$stop_lat[keep]
+  out[!duplicated(out$stop_id), , drop = FALSE]
+}
+
 build_walk_transit_isochrone <- function(
     location_sf, total_time_min, dep_secs,
     walk_to_stop_min, walk_from_stop_min,
@@ -639,7 +733,7 @@ build_walk_transit_isochrone <- function(
       end_time_i   <- start_time_i + remaining_budget_before_transit * 60
       
       iso_result <- tryCatch(
-        gtfsrouter::gtfs_isochrone(
+        gtfs_isochrone_compat(
           gtfs       = gtfs_router,
           from       = sid,
           start_time = start_time_i,
@@ -736,7 +830,41 @@ build_walk_transit_isochrone <- function(
 # functions in the global env, where they could not see mapbox_token/pretty_mode/
 # etc. -> "object 'mapbox_token' not found". local = TRUE defines them right here
 # in the app env, alongside the helpers they call.
-source("code/iso_metrics_AUDITED.R", local = TRUE)
+# code/iso_metrics_AUDITED.R carries the SAME broken gtfsrouter::gtfs_isochrone()
+# call for the pure Transit mode. It is loaded here with that one call rewritten
+# to the shim above, so this file stays the only thing that changes on disk.
+# Equivalent to source("code/iso_metrics_AUDITED.R", local = TRUE) otherwise.
+.iso_audited_src <- paste(readLines("code/iso_metrics_AUDITED.R", warn = FALSE), collapse = "\n")
+
+# (a) the missing routing function, as above.
+if (!grepl("gtfsrouter::gtfs_isochrone(", .iso_audited_src, fixed = TRUE))
+  message("[app] no gtfs_isochrone call found in code/iso_metrics_AUDITED.R - loading it unchanged.")
+.iso_audited_src <- gsub("gtfsrouter::gtfs_isochrone(", "gtfs_isochrone_compat(",
+                         .iso_audited_src, fixed = TRUE)
+
+# (b) the Transit polygon is the convex hull of the REACHABLE STOPS only, which
+# does not contain the origin. Whenever the lines serving the nearest stop run
+# off in one direction, the hull sits to one side and the start point falls
+# outside its own isochrone. Adding the origin to the point set fixes that: a
+# convex hull of a set containing the origin always contains the origin.
+# The origin is added as a small DISC, not a bare point: added as a point it
+# becomes a vertex of the convex hull, so it lands exactly on the boundary and
+# still reads as "outside" to the user and to st_within(). 100 m matches the
+# buffer this file already uses for the few-stops fallback below.
+.iso_audited_src <- sub(
+  "st_convex_hull(st_union(reachable_sf))",
+  paste0("st_convex_hull(st_combine(c(st_geometry(reachable_sf), ",
+         "st_geometry(st_transform(st_buffer(st_transform(location_sf, 3857), 100), 4326)))))"),
+  .iso_audited_src, fixed = TRUE)
+.iso_audited_src <- sub(
+  "st_union(st_buffer(st_transform(reachable_sf, 3857), 100))",
+  "st_union(st_buffer(st_transform(st_combine(c(st_geometry(reachable_sf), st_geometry(location_sf))), 3857), 100))",
+  .iso_audited_src, fixed = TRUE)
+
+# Evaluated at top level, so the definitions land in this app environment -
+# exactly where source(..., local = TRUE) would have put them.
+eval(parse(text = .iso_audited_src))
+rm(.iso_audited_src)
 
 # The audited helper is sourced into this app environment. Replace only its two
 # lazy lookup loaders so they keep using the absolute project-root paths above
@@ -3033,7 +3161,7 @@ ui <- dashboardPage(
             status = "primary", solidHeader = TRUE, width = 12,
             p(
               style = "font-size: 13px; color: #555;",
-              "All layers are toggled in the map's layer-control panel (top-right). The default base map is CartoDB Positron; you can switch to Street or Satellite."
+              "All layers are toggled in the map's layer-control panel (top-right). The default base map is the OpenStreetMap street map; you can switch to National Geographic, CartoDB Positron or Satellite. CartoDB now requires an API key and may render blank without one."
             ),
             tags$table(
               class = "table table-hover table-sm",
@@ -3754,8 +3882,9 @@ server <- function(input, output, session) {
     coldspot_sf <- safe_biodiv_coldspots()
     
     m <- leaflet() |>
-      addProviderTiles(providers$CartoDB.Positron, group = "CartoDB.Positron") |>
       addTiles(group = "Street Map (Default)") |>
+      addProviderTiles(providers$Esri.NatGeoWorldMap, group = "National Geographic") |>
+      addProviderTiles(providers$CartoDB.Positron, group = "CartoDB.Positron") |>
       addProviderTiles(providers$Esri.WorldImagery, group = "Satellite (ESRI)") |>
       addPolygons(
         data = cbg_vect_sf, group = "Income",
@@ -3990,7 +4119,7 @@ server <- function(input, output, session) {
     m |>
       setView(lng = -122.4194, lat = 37.7749, zoom = 12) |>
       addLayersControl(
-        baseGroups = c("CartoDB.Positron", "Street Map (Default)", "Satellite (ESRI)"),
+        baseGroups = c("Street Map (Default)", "National Geographic", "CartoDB.Positron", "Satellite (ESRI)"),
         overlayGroups = c(
           "Income", "Existing SF Greenspace", "RSF Program Projects",
           "Species Richness", "Data Availability",
@@ -4018,8 +4147,9 @@ server <- function(input, output, session) {
       addMapPane("corridorBasePane", zIndex = 360) |>
       addMapPane("corridorIsochronePane", zIndex = 385) |>
       addMapPane("corridorProposalPane", zIndex = 430) |>
-      addProviderTiles(providers$CartoDB.Positron, group = "CartoDB.Positron") |>
       addTiles(group = "Street Map") |>
+      addProviderTiles(providers$Esri.NatGeoWorldMap, group = "National Geographic") |>
+      addProviderTiles(providers$CartoDB.Positron, group = "CartoDB.Positron") |>
       addProviderTiles(providers$Esri.WorldImagery, group = "Satellite (ESRI)") |>
       addPolygons(
         data = osm_greenspace,
@@ -4083,7 +4213,7 @@ server <- function(input, output, session) {
         )
       ) |>
       addLayersControl(
-        baseGroups = c("CartoDB.Positron", "Street Map", "Satellite (ESRI)"),
+        baseGroups = c("Street Map", "National Geographic", "CartoDB.Positron", "Satellite (ESRI)"),
         overlayGroups = c(
           "Existing SF Greenspace", "SF EJ Communities", "Explorer Location",
           "Active Analysis Isochrone",
@@ -8041,7 +8171,7 @@ server <- function(input, output, session) {
   setup_cmp_point <- function(map_id, geocoder_id, point_rv, marker_color) {
     output[[map_id]] <- renderLeaflet({
       leaflet() |>
-        addProviderTiles(providers$CartoDB.Positron) |>
+        addTiles() |>
         setView(lng = -122.4194, lat = 37.7749, zoom = 12)
     })
     

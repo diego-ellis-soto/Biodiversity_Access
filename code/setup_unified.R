@@ -137,6 +137,28 @@ rsf_projects <- st_read(hf_or_local("RSF_Program_Projects_polygons.gpkg"), quiet
 # ----------------------------------------------------------------------------
 # CalEnviroScreen 4.0 (pre-filtered to SF) -- map overlay
 # ----------------------------------------------------------------------------
+# CalEnviroScreen 5.0 (OEHHA draft), from the lab's statewide GeoParquet. The
+# legacy calenviro_sf.gpkg below is an earlier vintage with 192 SF tracts; 5.0
+# has 241, so they are kept as separate layers rather than silently swapped.
+# sf cannot open the parquet without a GDAL Parquet driver most builds lack, and
+# the geometry column is "Shape", so it goes through duckdb-spatial as WKT.
+ces5_sf <- tryCatch({
+  f <- file.path(cache_dir, "ces5_sf.gpkg")
+  if (file.exists(f)) sf::st_read(f, quiet = TRUE) else {
+    con <- DBI::dbConnect(duckdb::duckdb())
+    on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+    DBI::dbExecute(con, "INSTALL spatial; LOAD spatial; INSTALL httpfs; LOAD httpfs;")
+    q <- paste0("SELECT tract, CIscore, CIscore_Pctl, county, ST_AsText(Shape) AS wkt ",
+      "FROM read_parquet('https://s3-west.nrp-nautilus.io/public-calenviroscreen/",
+      "calenviroscreen-5-0/ces5.parquet') WHERE county = 'San Francisco'")
+    x <- DBI::dbGetQuery(con, q)
+    g <- sf::st_as_sf(x, wkt = "wkt", crs = 4326)
+    sf::st_write(g, f, delete_dsn = TRUE, quiet = TRUE)
+    g
+  }
+}, error = function(e) { warning("CalEnviroScreen 5.0 failed to load: ", e$message); NULL })
+if (!is.null(ces5_sf)) message("[setup] CalEnviroScreen 5.0: ", nrow(ces5_sf), " SF tracts")
+
 cenv_sf <- tryCatch({
   sf::st_read(hf_or_local("calenviro_sf.gpkg"), quiet = TRUE)
 }, error = function(e) {
@@ -213,12 +235,31 @@ cbg_greenspace_coverage <- if (file.exists(cov_path)) {
 message("[setup] loading GTFS (stops, routes, headways, routing timetable)…")
 
 # ----------------------------------------------------------------------------
-# GTFS (SF Muni)
+# GTFS (SF Muni + BART + Caltrain, merged)
 # ----------------------------------------------------------------------------
-gtfs_zip_path <- hf_or_local("sf_muni_gtfs.zip")
+# Muni alone understated transit access in the Mission, Glen Park and Balboa
+# Park, where BART runs down Mission and Muni Metro has no equivalent - a bias
+# concentrated in the higher-burden half of the city, so it does not cancel in
+# the citywide ECDF. code/prep/build_regional_gtfs.R merges the three feeds.
+gtfs_regional_zip <- file.path(cache_dir, "sf_regional_gtfs.zip")
+if (!file.exists(gtfs_regional_zip) && file.exists("code/prep/build_regional_gtfs.R")) {
+  message("[setup] merged GTFS absent; building it once (a minute or two)…")
+  try(source("code/prep/build_regional_gtfs.R", local = new.env()), silent = FALSE)
+}
+if (file.exists(gtfs_regional_zip)) {
+  gtfs_zip_path  <- gtfs_regional_zip
+  GTFS_SCOPE     <- "regional"
+} else {
+  gtfs_zip_path  <- hf_or_local("sf_muni_gtfs.zip")
+  GTFS_SCOPE     <- "muni-only"
+  warning("Falling back to the Muni-only feed: transit access will be understated ",
+          "in the Mission, Glen Park and Balboa Park. Run code/prep/build_regional_gtfs.R.")
+}
+message("[setup] GTFS scope: ", GTFS_SCOPE, " (", basename(gtfs_zip_path), ")")
 
 # Unzip for read.csv(stops.txt, …); gtfsrouter/tidytransit read the .zip directly.
-gtfs_unzip_dir <- file.path(cache_dir, "muni_gtfs")
+# Cache key carries the scope so a Muni-only unzip is never reused for it.
+gtfs_unzip_dir <- file.path(cache_dir, paste0(GTFS_SCOPE, "_gtfs"))
 dir.create(gtfs_unzip_dir, recursive = TRUE, showWarnings = FALSE)
 if (!dir.exists(gtfs_unzip_dir) || length(list.files(gtfs_unzip_dir, pattern = "\\.txt$")) == 0L) {
   unzip(gtfs_zip_path, exdir = gtfs_unzip_dir, overwrite = TRUE)
@@ -268,7 +309,8 @@ if (!file.exists(hw_csv) && file.exists(hw_rds)) {
 }
 
 gtfs_stop_headways <- tryCatch({
-  headways_path <- hf_or_local("gtfs_stop_headways.csv")
+  headways_path <- file.path(cache_dir, if (GTFS_SCOPE == "regional")
+      "gtfs_stop_headways_regional.csv" else "gtfs_stop_headways.csv")
   if (file.exists(headways_path)) {
     readr::read_csv(headways_path, show_col_types = FALSE) |>
       mutate(stop_id = as.character(stop_id))
@@ -282,7 +324,7 @@ gtfs_stop_headways <- tryCatch({
         .groups = "drop"
       ) |>
       mutate(stop_id = as.character(stop_id))
-    readr::write_csv(hw, hw_csv)
+    readr::write_csv(hw, headways_path)
     hw
   }
 }, error = function(e) { warning("tidytransit headway computation failed: ", e$message); NULL })
@@ -295,13 +337,22 @@ if (!is.null(gtfs_stop_headways) && !is.null(gtfs_stops_sf)) {
 
 # --- gtfsrouter timetable: routes transit isochrones (precomputed .rds) ------
 gtfs_router <- tryCatch({
-  timetable_path <- hf_or_local("gtfs_timetable_monday.rds")
-  if (file.exists(timetable_path)) {
+  # Prefer the transfers-enriched timetable built by code/prep/build_regional_gtfs.R:
+  # it carries the distance-generated inter-operator transfers (tens of thousands)
+  # rather than the handful the raw feeds ship, and it is routed on a real date.
+  # Both candidates are ignored if they predate the feed, or a stale cache from an
+  # older merge is silently reused - which is exactly what happened once already.
+  enriched_path  <- file.path(cache_dir, paste0("gtfs_timetable_monday_", GTFS_SCOPE, "_transfers.rds"))
+  timetable_path <- file.path(cache_dir, paste0("gtfs_timetable_monday_", GTFS_SCOPE, ".rds"))
+  fresh <- function(p) file.exists(p) && file.mtime(p) >= file.mtime(gtfs_zip_path)
+  if (fresh(enriched_path)) {
+    readRDS(enriched_path)
+  } else if (fresh(timetable_path)) {
     readRDS(timetable_path)
   } else {
     gr <- gtfsrouter::extract_gtfs(gtfs_zip_path)
     result <- gtfsrouter::gtfs_timetable(gr, day = "Monday")
-    saveRDS(result, file.path(cache_dir, "gtfs_timetable_monday.rds"))
+    saveRDS(result, timetable_path)
     result
   }
 }, error = function(e) { warning("gtfsrouter failed to initialise: ", e$message); NULL })

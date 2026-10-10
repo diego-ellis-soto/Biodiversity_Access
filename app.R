@@ -150,9 +150,15 @@ source("code/setup_unified.R")
 # to be applied to the RAW feed BEFORE gtfs_timetable(). setup_unified.R caches
 # a timetable built without transfers, which is the second reason transit
 # returns nothing. Prefer a transfers-enriched cache and build it once if absent.
-if (!is.null(gtfs_router) && is.null(gtfs_router$transfers)) {
+# The merged feed ships a transfers.txt of its own (31 rows), so testing
+# is.null(transfers) is not enough - it passes while the distance-generated
+# inter-operator transfers are missing. The prep script tags its output with a
+# "build" attribute; anything without that tag needs enriching here.
+if (!is.null(gtfs_router) &&
+    (is.null(attr(gtfs_router, "build")) || is.null(gtfs_router$transfers))) {
   gtfs_router <- tryCatch({
-    enriched <- file.path(cache_dir, "gtfs_timetable_monday_transfers.rds")
+    enriched <- file.path(cache_dir,
+        paste0("gtfs_timetable_monday_", GTFS_SCOPE, "_transfers.rds"))
     if (file.exists(enriched)) {
       readRDS(enriched)
     } else {
@@ -171,6 +177,59 @@ if (!is.null(gtfs_router) && is.null(gtfs_router$transfers)) {
 if (!is.null(gtfs_router) && is.null(gtfs_router$transfers)) {
   message("[app] GTFS timetable has no transfers table - transit modes will return nothing.")
 }
+
+# --- loud checks for the three things that fail SILENTLY in this stack -------
+# (1) no transfers table -> gtfs_traveltimes() returns nothing, no error
+# (2) expired calendar.txt -> empty isochrones, no error
+# (3) a feed whose service_ids miss the routing day -> empty timetable, no error
+gtfs_health <- local({
+  out <- list(ok = TRUE, notes = character())
+  say <- function(...) { out$notes <<- c(out$notes, paste0(...)); out$ok <<- FALSE }
+  if (is.null(gtfs_router)) { say("no GTFS timetable at all"); return(out) }
+  if (is.null(gtfs_router$transfers) || !nrow(gtfs_router$transfers))
+    say("timetable has no transfers table; gtfs_traveltimes() will return nothing")
+  if (is.null(gtfs_router$timetable) || !nrow(gtfs_router$timetable))
+    say("timetable is EMPTY; every transit isochrone will come back blank")
+  # every operator in the merged feed must survive into the routing day
+  ops_feed <- unique(sub("_.*", "", gtfs_router$stops$stop_id))
+  served   <- gtfs_router$stops$stop_id[unique(c(gtfs_router$timetable$departure_station,
+                                                 gtfs_router$timetable$arrival_station))]
+  ops_live <- unique(sub("_.*", "", served))
+  if (length(setdiff(ops_feed, ops_live)))
+    say("operators in the feed but absent from the Monday timetable: ",
+        paste(setdiff(ops_feed, ops_live), collapse = ", "))
+  # calendar coverage: expired feeds still route by weekday, but the schedule is stale
+  cal <- try(gtfs_router$calendar, silent = TRUE)
+  if (!inherits(cal, "try-error") && !is.null(cal) && "end_date" %in% names(cal)) {
+    cal <- as.data.frame(cal)
+    cal$op  <- sub("_.*", "", cal$service_id)
+    cal$end <- as.Date(as.character(cal$end_date), "%Y%m%d")
+    stale <- stats::aggregate(end ~ op, cal, max)
+    stale <- stale[stale$end < Sys.Date(), ]
+    if (nrow(stale))
+      say("schedule EXPIRED for: ",
+          paste(sprintf("%s (ended %s)", stale$op, stale$end), collapse = ", "),
+          " - routing still works by weekday, but on an out-of-date timetable")
+  }
+  out
+})
+if (!gtfs_health$ok) for (n in gtfs_health$notes) message("[app][GTFS] ", n)
+# Which mode x time combinations have a precomputed reference? add_reference_bai()
+# needs same-mode, same-time percentiles and never falls back, so a time budget
+# with no reference yields BAI = NA with no message. Make that visible instead.
+REFERENCE_TIMES <- tryCatch({
+  rp <- "outputs/results/isochrone_basi_100m.rds"
+  if (file.exists(rp)) sort(unique(readRDS(rp)$time_min)) else numeric(0)
+}, error = function(e) numeric(0))
+message("[app] BAI reference available for time budgets: ",
+        paste(REFERENCE_TIMES, collapse = ", "), " min")
+
+bd <- attr(gtfs_router, "build")
+if (!is.null(bd)) message("[app] routing on ", format(bd$route_date, "%A %d %b %Y"),
+                          " (last date inside every feed's service window)")
+message("[app] GTFS scope: ", GTFS_SCOPE, " | stops: ",
+        if (is.null(gtfs_stops_sf)) 0 else nrow(gtfs_stops_sf),
+        " | transfers: ", if (is.null(gtfs_router$transfers)) 0 else nrow(gtfs_router$transfers))
 
 # =============================================================================
 # GLOBAL CONFIG
@@ -740,8 +799,25 @@ build_transit_isochrone_union <- function(
   if (length(board) > 0) {
     # nearest few boarding stops only: routing every stop within walking range
     # would make one map click take tens of seconds and barely move the shape.
-    board <- board[order(access_min[board])][seq_len(min(length(board), max_board_stops))]
-    
+    #
+    # But distance alone is not enough once the feed is multi-operator. The 8
+    # nearest stops in central San Francisco are all Muni bus stops: the median
+    # block group that can walk to BART has 49 stops within 600 m and ranks its
+    # BART station 30th. Of 150 block groups with a BART stop inside 800 m, only
+    # 22 had one among the 8 nearest. Boarding by distance therefore discards
+    # rail entirely and silently cancels the BART/Caltrain merge in exactly the
+    # neighbourhoods it exists to fix. So: the nearest few overall, PLUS the
+    # nearest stop of each operator in range. On a single-operator feed the
+    # second part adds nothing, so this is safe either way.
+    op_of <- function(x) {
+      p <- sub("_.*", "", as.character(x))
+      ifelse(p %in% c("muni", "bart", "cal"), p, "other")
+    }
+    board <- board[order(access_min[board])]
+    ops   <- op_of(gtfs_stops_sf$stop_id[board])
+    board <- unique(c(head(board, max_board_stops),
+                      board[!duplicated(ops)]))
+
     sid_all <- as.character(gtfs_stops_sf$stop_id)
     best <- rep(Inf, length(sid_all))      # best total time to reach each stop
     for (bi in board) {
@@ -4036,7 +4112,15 @@ server <- function(input, output, session) {
   output$isoMap <- renderLeaflet({
     pal_cbg  <- colorNumeric("YlOrRd", cbg_vect_sf$medincE)
     pal_rich <- colorNumeric("YlOrRd", domain = cbg_vect_sf$unique_species)
-    pal_data <- colorNumeric("Blues", domain = cbg_vect_sf$n_observations)
+    # GBIF effort is extremely right-skewed: across SF block groups the median is
+    # 72 records, the maximum 740,656, and the top 1% of block groups hold 68% of
+    # every record in the city. On a linear ramp that paints Golden Gate Park dark
+    # and the entire rest of the city white, which is exactly the inequality the
+    # map is supposed to let you SEE rather than hide. Log-spaced bins in real
+    # units keep the legend readable without a transformed axis to explain.
+    avail_bins <- c(0, 1, 10, 50, 200, 1000, 5000, 50000, Inf)
+    pal_data <- colorBin("Blues", domain = cbg_vect_sf$n_observations,
+                         bins = avail_bins, na.color = "transparent")
     
     hotspot_sf <- safe_biodiv_hotspots()
     coldspot_sf <- safe_biodiv_coldspots()
@@ -4063,8 +4147,16 @@ server <- function(input, output, session) {
       ) |>
       addPolygons(
         data = cbg_vect_sf, group = "Data Availability",
-        fillColor = ~pal_data(n_observations), fillOpacity = 0.6,
-        color = "white", weight = 1, label = ~n_observations
+        fillColor = ~pal_data(n_observations), fillOpacity = 0.75,
+        color = "white", weight = 1,
+        label = ~sprintf("%s GBIF records", format(n_observations, big.mark = ","))
+      ) |>
+      addLegend(
+        position = "bottomleft", pal = pal_data,
+        values = cbg_vect_sf$n_observations,
+        title = "GBIF records<br>per block group",
+        labFormat = labelFormat(big.mark = ","),
+        group = "Data Availability"
       )
     
     if (FALSE && !is.null(hotspot_sf)) {
@@ -4263,6 +4355,31 @@ server <- function(input, output, session) {
         )
     }
     
+    if (!is.null(ces5_sf)) {
+      # The published CalEnviroScreen map colours TRACTS BY PERCENTILE, not by
+      # raw score, in ten classes on OEHHA's yellow-to-dark-red ramp. Colouring
+      # by raw CIscore instead compresses most of the city into one shade, the
+      # same mistake the Data Availability layer used to make.
+      CES_DECILES <- c("#FFFFCC", "#FFEDA0", "#FED976", "#FEB24C", "#FD8D3C",
+                       "#FC4E2A", "#E31A1C", "#BD0026", "#980043", "#800026")
+      ces_pal <- colorBin(CES_DECILES, domain = c(0, 100), bins = seq(0, 100, 10),
+                          na.color = "transparent")
+      m <- m |>
+        addPolygons(
+          data = ces5_sf, group = "CalEnviroScreen 5.0",
+          fillColor = ~ces_pal(CIscore_Pctl), fillOpacity = 0.7,
+          color = "white", weight = 0.5,
+          label = ~sprintf("Tract %s - CES 5.0 score %.1f (%.0fth percentile statewide)",
+                           tract, CIscore, CIscore_Pctl)
+        ) |>
+        addLegend(
+          position = "bottomright", pal = ces_pal, values = c(0, 100),
+          title = "CalEnviroScreen 5.0<br>percentile (statewide)",
+          labFormat = labelFormat(suffix = "%"),
+          group = "CalEnviroScreen 5.0"
+        )
+    }
+
     if (!is.null(sf_ej_sf)) {
       m <- m |>
         addPolygons(
@@ -4283,7 +4400,7 @@ server <- function(input, output, session) {
         overlayGroups = c(
           "Income", "Existing SF Greenspace", "RSF Program Projects",
           "Species Richness", "Data Availability",
-          "CalEnviroScreen (CI Score)", "SF EJ Communities",
+          "CalEnviroScreen 5.0", "CalEnviroScreen (CI Score)", "SF EJ Communities",
           "Transit Routes", "Transit Stops",
           "Isochrones", "Transit Isochrones", "Muni Stops Reached", "NDVI Raster"
         ),
@@ -4293,6 +4410,7 @@ server <- function(input, output, session) {
       hideGroup("RSF Program Projects") |>
       hideGroup("Species Richness") |>
       hideGroup("Data Availability") |>
+      hideGroup("CalEnviroScreen 5.0") |>
       hideGroup("CalEnviroScreen (CI Score)") |>
       hideGroup("SF EJ Communities") |>
       hideGroup("Transit Routes") |>
@@ -5688,7 +5806,22 @@ server <- function(input, output, session) {
     if (is.null(pt)) return()
     if (length(input$transport_modes) == 0) return()
     if (length(input$iso_times) == 0) return()
-    
+
+    # A time budget with no precomputed reference still produces a valid
+    # isochrone and valid raw metrics, but add_reference_bai() has nothing to
+    # rank it against, so the Biodiversity Access Index comes back NA. Say so
+    # rather than showing a blank index.
+    no_ref <- setdiff(as.numeric(input$iso_times), REFERENCE_TIMES)
+    if (length(no_ref)) {
+      showNotification(
+        HTML(paste0("<b>", paste(no_ref, collapse = ", "), "-minute isochrones have no ",
+          "citywide reference yet.</b> The map and the raw metrics are correct; the ",
+          "Biodiversity Access Index needs same-mode, same-time percentiles and will ",
+          "be blank for ", ifelse(length(no_ref) > 1, "those budgets", "that budget"),
+          " until <code>code/prep/extend_reference.R</code> is run.")),
+        type = "warning", duration = 12)
+    }
+
     leafletProxy("isoMap") |>
       removeControl("ndvi_legend") |>
       clearGroup("Isochrones") |>

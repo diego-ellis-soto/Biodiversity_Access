@@ -49,4 +49,6 @@ outputs/tables/
 data/raw/
 data/intermediate/
 
+*.sbatch
+
 

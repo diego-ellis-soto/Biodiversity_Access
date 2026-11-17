@@ -1,7 +1,8 @@
 # ============================================================================
 # Prep: GBIF (DuckDB) → sf-gbif.parquet → CBG + NDVI → gbif_census_ndvi_anno.parquet
 # ============================================================================
-# 1) COPY San Francisco iNaturalist occurrences from attached gbif.duckdb → parquet
+# 1) COPY San Francisco occurrences (all institutions; coordinate uncertainty
+#    < 300 m or missing) from attached gbif.duckdb → parquet
 # 2) Join census block groups, extract NDVI, write annotated parquet for the app
 #
 # Requires: local gbif.duckdb path below; data/source/cbg_vect_sf.Rdata,
@@ -27,8 +28,12 @@ library(arrow)
 # ============================================================================
 
 scon <- dbConnect(duckdb())
+# Cap memory and spill (shared scratch disks)
+scon |> dbExecute("SET memory_limit='12GB';")
+scon |> dbExecute("SET temp_directory='/tmp/duckdb_spill';")
+scon |> dbExecute("SET max_temp_directory_size='300GB';")
 scon |> dbExecute("INSTALL spatial; LOAD spatial;")
-scon |> dbExecute("ATTACH '~/Data/Occurrences/GBIF/gbif.duckdb' AS gbifmain;")
+scon |> dbExecute("ATTACH '~/Data/Occurrences/GBIF/gbif.duckdb' AS gbifmain (READ_ONLY);")
 
 scon |> dbExecute(
   "COPY
@@ -36,7 +41,8 @@ scon |> dbExecute(
 NATURAL JOIN gbifmain.join_lookup
 WHERE stateprovince='California'
 AND county_name='San Francisco'
-AND institutioncode='iNaturalist'
+-- AND institutioncode='iNaturalist'
+AND (coordinateuncertaintyinmeters < 300 OR coordinateuncertaintyinmeters IS NULL)
 AND decimallatitude IS NOT NULL
 AND decimallongitude IS NOT NULL)
 TO

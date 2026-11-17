@@ -46,7 +46,9 @@ library(glue)
 # ----------------------------------------------------------------------------
 # HuggingFace base URL + cache dir + download helper
 # ----------------------------------------------------------------------------
-HF_BASE <- "https://huggingface.co/datasets/boettiger-lab/sf_biodiv_access/resolve/main"
+# TEMP: personal fork with the all-institutions GBIF parquet. Switch back to
+# boettiger-lab/sf_biodiv_access once that parquet is uploaded there (before merging to main).
+HF_BASE <- "https://huggingface.co/datasets/avephill/sf_biodiv_access/resolve/main"
 
 # Use data/cached/ when running locally (writable), otherwise fall back to
 # /tmp/sf_biodiv_cache/ for read-only environments like HuggingFace Spaces.

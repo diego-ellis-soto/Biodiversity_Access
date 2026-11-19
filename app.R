@@ -144,6 +144,8 @@ if (length(.missing_harmonized_files) > 0) {
 # Load the shared metric definition BEFORE the audited metric helper.
 source("code/iso_metric_definitions.R")
 source("code/setup_unified.R")
+# Species accumulation curves (needs ISO_PLANT_CLASSES from the definitions)
+source("code/iso_accumulation_curves.R")
 
 # --- transit fix: the timetable must carry a transfers table ----------------
 # gtfs_traveltimes() refuses to run without one, and gtfs_transfer_table() has
@@ -203,6 +205,10 @@ theme <- bs_theme(
 # GBIF UI VALUES FROM PARQUET
 # =============================================================================
 con_temp <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+# Cap memory and spill (shared scratch disks)
+dbExecute(con_temp, "SET memory_limit='4GB';")
+dbExecute(con_temp, "SET temp_directory='/tmp/duckdb_spill';")
+dbExecute(con_temp, "SET max_temp_directory_size='10GB';")
 dbExecute(con_temp, "INSTALL spatial; LOAD spatial;")
 dbExecute(con_temp, "INSTALL httpfs; LOAD httpfs;")
 gbif_tab_temp <- tbl(con_temp, glue("read_parquet('{gbif_parquet}')"))
@@ -2368,7 +2374,22 @@ ui <- dashboardPage(
     theme = theme,
     # useShinyjs(),   # removed with library(shinyjs) -- no shinyjs features are used
     div(id = "loading", style = "display:none; font-size:20px; color:red;", "Calculating..."),
-    
+
+    # Instant feedback on "Generate Isochrones": the browser swaps the button to
+    # a spinner on click, without waiting for the server, and restores it when
+    # the server goes idle again.
+    tags$script(HTML("
+      $(document).on('click', '#generate_iso', function() {
+        var btn = $(this);
+        if (btn.data('busy')) return;
+        btn.data('busy', true).data('label', btn.html());
+        btn.html('<i class=\"fa fa-spinner fa-spin\"></i> Generating isochrones...').addClass('disabled');
+        $(document).one('shiny:idle', function() {
+          btn.html(btn.data('label')).removeClass('disabled').data('busy', false);
+        });
+      });
+    ")),
+
     tabItems(
       tabItem(
         tabName = "isochrone",
@@ -2606,8 +2627,30 @@ ui <- dashboardPage(
             collapsed = TRUE,
             plotOutput("transitMetricsPlot", height = "450px") %>% withSpinner(type = 8, color = "#005B95")
           )
+        ),
+
+        # Species accumulation curves: transport modes as columns, taxonomic
+        # groups as rows. Open by default so the curves are visible as soon as
+        # the isochrones are ready.
+        conditionalPanel(
+          condition = "output.iso_ready",
+          fluidRow(
+            box(
+              title = "Species Accumulation Curves by Mode and Taxonomic Group",
+              status = "primary",
+              solidHeader = TRUE,
+              width = 12,
+              collapsible = TRUE,
+              collapsed = FALSE,
+              p("How quickly new species turn up as more of each isochrone is sampled. ",
+                "A curve that is still climbing means the area is under-sampled: more species ",
+                "would be recorded with more observations. A curve that flattens means most ",
+                "species reachable there have already been recorded."),
+              plotOutput("accumulationCurvesPlot", height = "950px") %>% withSpinner(type = 8, color = "#005B95")
+            )
+          )
         )
-        
+
       ),
       
       # =====================================================================
@@ -3879,6 +3922,10 @@ server <- function(input, output, session) {
   # DuckDB connection
   # ---------------------------------------------------------------------------
   con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+  # Cap memory and spill (shared scratch disks)
+  dbExecute(con, "SET memory_limit='4GB';")
+  dbExecute(con, "SET temp_directory='/tmp/duckdb_spill';")
+  dbExecute(con, "SET max_temp_directory_size='10GB';")
   dbExecute(con, "INSTALL spatial; LOAD spatial;")
   dbExecute(con, "INSTALL httpfs; LOAD httpfs;")
   gbif_tab <- tbl(con, glue("read_parquet('{gbif_parquet}')"))
@@ -5698,15 +5745,19 @@ server <- function(input, output, session) {
     
     # All isochrone construction lives in build_isochrones() (code/iso_metrics_AUDITED.R)
     # so the comparer tab builds isochrones the exact same way.
-    iso_store$data <- build_isochrones(
-      point                        = pt,
-      modes                        = input$transport_modes,
-      times                        = input$iso_times,
-      transit_hour                 = input$transit_hour,
-      walk_to_stop_min             = input$walk_to_stop_min,
-      walk_from_stop_min           = input$walk_from_stop_min,
-      transit_departure_window_min = input$transit_departure_window_min
-    )
+    # The progress message is sent to the browser before the (slow) Mapbox and
+    # transit routing calls start, so the button press is acknowledged at once.
+    withProgress(message = "Generating isochrones...", detail = "Requesting travel-time areas", value = 0.1, {
+      iso_store$data <- build_isochrones(
+        point                        = pt,
+        modes                        = input$transport_modes,
+        times                        = input$iso_times,
+        transit_hour                 = input$transit_hour,
+        walk_to_stop_min             = input$walk_to_stop_min,
+        walk_from_stop_min           = input$walk_from_stop_min,
+        transit_departure_window_min = input$transit_departure_window_min
+      )
+    })
   })
   
   # ---------------------------------------------------------------------------
@@ -8269,6 +8320,54 @@ server <- function(input, output, session) {
       )
   })
   
+  # ---------------------------------------------------------------------------
+  # Species accumulation curves
+  # ---------------------------------------------------------------------------
+  # Uses the same 100 m cell support and GBIF cell lookup as the species counts
+  # above. Returns list(observed, curves):
+  #   observed -- species recorded and cells sampled, per isochrone x group
+  #   curves   -- accumulation curve points, per isochrone x group (absent
+  #               where there are too few records for a curve)
+  accumulation_curves <- reactive({
+    iso_data <- isochrones_data()
+    if (is.null(iso_data) || nrow(iso_data) == 0) return(NULL)
+    species_cells <- load_iso_species_cell_lookup()
+    if (is.null(species_cells)) return(NULL)
+    
+    iso_modes <- pretty_mode(as.character(iso_data$mode))
+    iso_times <- as.numeric(iso_data$time)
+    
+    observed <- list()
+    curves <- list()
+    n_isos <- nrow(iso_data)
+    withProgress(message = "Computing accumulation curves...", value = 0, {
+      for (i in seq_len(n_isos)) {
+        incProgress(1 / n_isos, detail = paste0(iso_modes[i], " – ", iso_times[i], " min"))
+        
+        # 100 m cells whose centroid falls inside this isochrone
+        cell_ids <- unique(iso_metric_support(iso_data[i, ])$cell_id)
+        
+        observed[[i]] <- iso_accumulation_observed_by_group(species_cells, cell_ids) |>
+          mutate(mode = iso_modes[i], time = iso_times[i])
+        
+        curves_i <- iso_accumulation_curves_by_group(species_cells, cell_ids)
+        if (nrow(curves_i) == 0) next
+        curves[[i]] <- curves_i |>
+          mutate(mode = iso_modes[i], time = iso_times[i])
+      }
+    })
+    list(observed = bind_rows(observed), curves = bind_rows(curves))
+  })
+  
+  output$accumulationCurvesPlot <- renderPlot({
+    result <- accumulation_curves()
+    validate(need(
+      !is.null(result) && nrow(result$curves) > 0,
+      "Too few GBIF records inside these isochrones to draw accumulation curves."
+    ))
+    plot_iso_accumulation_curves(result$curves, result$observed)
+  })
+
   output$radarPlot <- renderPlot({
     df <- baseline_biodiversity_access_index()
     if (is.null(df) || nrow(df) == 0) return(NULL)

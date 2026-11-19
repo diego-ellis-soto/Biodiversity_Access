@@ -25,6 +25,7 @@ install.packages(c(
   "lubridate",
   "ggplot2",
   "scales",
+  "patchwork",
   
   # Spatial
   "sf",

@@ -23,9 +23,9 @@ hms_to_min <- function(x) {
 
 # gtfs_traveltimes() REFUSES to run without a transfers table, and
 # gtfs_transfer_table() must be applied to the RAW feed BEFORE gtfs_timetable().
-enriched <- "data/cached/gtfs_timetable_monday_transfers.rds"
+enriched <- "data/cached/gtfs_timetable_monday_regional_transfers.rds"  # Muni + BART + Caltrain
 g <- if (file.exists(enriched)) readRDS(enriched) else {
-  raw <- extract_gtfs("data/cached/sf_muni_gtfs.zip", quiet=TRUE)
+  raw <- extract_gtfs("data/cached/sf_regional_gtfs.zip", quiet=TRUE)
   raw <- gtfs_transfer_table(raw, d_limit=200, min_transfer_time=120)
   tt  <- gtfs_timetable(raw, day="Monday", quiet=TRUE)
   saveRDS(tt, enriched); tt

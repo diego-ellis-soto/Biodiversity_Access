@@ -170,6 +170,11 @@ cenv_sf <- tryCatch({
 # ----------------------------------------------------------------------------
 sf_ej_sf <- tryCatch({
   sf::st_read(hf_or_local("sf_ej_communities_map.gpkg"), quiet = TRUE) |>
+    # score = 999 is the source map's grey no-data class (parks/open space),
+    # not a burden score (real scores run 0-30). Treat it as NA so it is
+    # labelled "Not EJ" and kept out of ej_bench and the corridor tool's
+    # EJ-vulnerable areas. See code/prep/fix_sf_ej_nodata.R.
+    dplyr::mutate(score = dplyr::if_else(score >= 999, NA_real_, as.numeric(score))) |>
     dplyr::mutate(
       symbol_hex = stringr::str_split(symbol_rgb, ",\\s*") |>
         lapply(function(x) sprintf("#%02X%02X%02X",

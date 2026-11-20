@@ -66,3 +66,6 @@ outputs/results/transit/
 # Local rollback copies of large reference files - regenerable, never commit
 outputs/results/*_pre_transit.rds
 outputs/results/*_backup.rds
+
+# SF EJ 999 fix: staging outputs and pre-fix backups (code/prep/fix_sf_ej_nodata.R)
+outputs/results/ej_fix/
